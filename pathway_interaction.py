@@ -1199,11 +1199,11 @@ def main_5fold_cv():
         test_metrics = evaluate_metrics(model, test_loader, device)
         
         # Load best model and evaluate
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
+        # if best_model_state is not None:
+        #     model.load_state_dict(best_model_state)
         
-        final_val_metrics = evaluate_metrics(model, val_loader, device)
-        test_metrics = evaluate_metrics(model, test_loader, device)
+        # final_val_metrics = evaluate_metrics(model, val_loader, device)
+        # test_metrics = evaluate_metrics(model, test_loader, device)
         
         # ===== ADD THIS SECTION =====
         # Analyze pathway importance for this fold
