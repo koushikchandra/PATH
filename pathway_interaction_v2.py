@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
 Pathway Interaction Analysis with Edge-Aware Graph Transformer
-Version 2.0 - Includes edge ablation experiments for significance testing
+Version 2.0 (Corrected) - Edge ablation experiments with proper methodology
 
 Changes from v1:
 - Added edge ablation experiment to test significance of learned edge values
 - Fixed duplicate evaluation code bug
 - Cleaned up commented code
 - Added visualization for ablation results
+
+Corrections in this version:
+- FIXED: Rebuild model structures (attention mask, PE) after each A modification
+- FIXED: Topology-preserving permutation (shuffle only non-zero edge weights)
+- FIXED: Proper permutation p-values instead of t-tests
+- FIXED: Increased default permutations to 200 for statistical power
+- FIXED: Random edges now topology-preserving
+- FIXED: Binary threshold uses median of learned weights
 """
 
 import os
@@ -38,7 +46,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 import copy
-import scipy.stats as stats
 
 
 # ===============================
@@ -498,6 +505,9 @@ class PathwayGraphTransformer(nn.Module):
         self.register_buffer("attn_mask", torch.empty(0))
         self.register_buffer("PE", torch.empty(0))
 
+        # Store pathway_gene_lists for rebuilding structures during ablation
+        self._pathway_gene_lists = None
+
     @staticmethod
     def build_pathway_index_and_mask(pathway_gene_lists: List[List[int]], num_genes: int):
         P = len(pathway_gene_lists)
@@ -523,6 +533,9 @@ class PathwayGraphTransformer(nn.Module):
 
     def set_structures(self, pathway_gene_lists: List[List[int]], adjacency: torch.Tensor):
         """Initialize pathway structures and adjacency matrix"""
+        # Store for later rebuilding during ablation experiments
+        self._pathway_gene_lists = pathway_gene_lists
+
         idx, msk = self.build_pathway_index_and_mask(pathway_gene_lists, self.num_genes)
         dev = next(self.parameters()).device
         self.pw_gene_idx = idx.to(dev)
@@ -537,6 +550,42 @@ class PathwayGraphTransformer(nn.Module):
         pe = self._laplacian_pe(A, self.pe_dim)
         self.PE = torch.cat([pe.detach(), deg.detach()], dim=1)
 
+        if self.full_graph_attention:
+            mask = torch.zeros_like(A)
+        else:
+            mask = torch.zeros_like(A)
+            if self.use_edge_mask:
+                nonedge = (A <= 0)
+                mask = mask.masked_fill(nonedge, -10.0)
+                mask.fill_diagonal_(0.0)
+
+        self.attn_mask = mask.detach()
+
+    def rebuild_from_adjacency(self, new_adjacency: torch.Tensor):
+        """
+        Rebuild all adjacency-dependent structures from a new adjacency matrix.
+        This properly updates A, PE, and attn_mask for ablation experiments.
+
+        Args:
+            new_adjacency: New adjacency matrix (will be symmetrized and normalized)
+        """
+        if self._pathway_gene_lists is None:
+            raise RuntimeError("Must call set_structures() before rebuild_from_adjacency()")
+
+        dev = next(self.parameters()).device
+
+        # Symmetrize and normalize
+        A = 0.5 * (new_adjacency + new_adjacency.T)
+        A = A / (A.max() + 1e-8)
+        A = A.to(dev)
+        self.A = A
+
+        # Rebuild positional encoding from new adjacency
+        deg = A.sum(1, keepdim=True) / (A.size(1) + 1e-8)
+        pe = self._laplacian_pe(A, self.pe_dim)
+        self.PE = torch.cat([pe.detach(), deg.detach()], dim=1)
+
+        # Rebuild attention mask from new adjacency
         if self.full_graph_attention:
             mask = torch.zeros_like(A)
         else:
@@ -718,22 +767,166 @@ def evaluate_metrics(model, loader, device):
 
 
 # ===============================
-# Edge Ablation Experiment
+# Edge Ablation Experiment (CORRECTED)
 # ===============================
 
-@torch.no_grad()
-def run_edge_ablation_experiment(model, test_loader, device, n_permutations=30):
+def permute_edge_weights_topology_preserving(A: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
     """
-    Compare model performance with learned edges vs ablated edges
+    Permute edge weights while preserving topology (which edges exist).
+    Only shuffles non-zero edge weights among non-zero positions.
 
-    This experiment tests whether the learned edge values (between 0 and 1)
-    have statistical significance in improving AUC or F1 score.
+    Args:
+        A: Adjacency matrix (symmetric, with zeros for non-edges)
+        seed: Optional random seed
+
+    Returns:
+        New adjacency matrix with same topology but shuffled weights
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    A_new = A.clone()
+
+    # Get upper triangle indices (excluding diagonal) where edges exist
+    rows, cols = torch.triu_indices(A.size(0), A.size(1), offset=1, device=A.device)
+    upper_vals = A[rows, cols]
+
+    # Find non-zero edges
+    nonzero_mask = upper_vals > 0
+    nonzero_indices = nonzero_mask.nonzero(as_tuple=True)[0]
+    nonzero_vals = upper_vals[nonzero_mask]
+
+    if len(nonzero_vals) > 1:
+        # Shuffle only the non-zero values
+        perm = torch.randperm(len(nonzero_vals), device=A.device)
+        shuffled_vals = nonzero_vals[perm]
+
+        # Put shuffled values back into upper triangle positions
+        new_upper = upper_vals.clone()
+        new_upper[nonzero_mask] = shuffled_vals
+
+        # Rebuild symmetric matrix
+        A_new[rows, cols] = new_upper
+        A_new[cols, rows] = new_upper  # Symmetrize
+
+    return A_new
+
+
+def random_edge_weights_topology_preserving(A: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
+    """
+    Replace edge weights with random values while preserving topology.
+    Non-edges (zeros) remain zero.
+
+    Args:
+        A: Adjacency matrix
+        seed: Optional random seed
+
+    Returns:
+        New adjacency matrix with same topology but random weights in (0, 1]
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    A_new = torch.zeros_like(A)
+
+    # Get upper triangle indices where edges exist
+    rows, cols = torch.triu_indices(A.size(0), A.size(1), offset=1, device=A.device)
+    upper_vals = A[rows, cols]
+    nonzero_mask = upper_vals > 0
+
+    # Generate random values for non-zero positions
+    n_edges = nonzero_mask.sum().item()
+    if n_edges > 0:
+        random_vals = torch.rand(n_edges, device=A.device) * 0.9 + 0.1  # Uniform in [0.1, 1.0]
+
+        new_upper = torch.zeros_like(upper_vals)
+        new_upper[nonzero_mask] = random_vals
+
+        A_new[rows, cols] = new_upper
+        A_new[cols, rows] = new_upper  # Symmetrize
+
+    return A_new
+
+
+def binarize_edge_weights(A: torch.Tensor, threshold: Optional[float] = None) -> torch.Tensor:
+    """
+    Binarize edge weights using threshold (default: median of non-zero values).
+    Preserves topology (non-edges stay zero).
+
+    Args:
+        A: Adjacency matrix
+        threshold: Threshold value (default: median of non-zero weights)
+
+    Returns:
+        Binarized adjacency matrix
+    """
+    A_new = torch.zeros_like(A)
+
+    # Get non-zero values
+    nonzero_mask = A > 0
+    nonzero_vals = A[nonzero_mask]
+
+    if len(nonzero_vals) == 0:
+        return A_new
+
+    # Use median if no threshold specified
+    if threshold is None:
+        threshold = float(nonzero_vals.median())
+
+    # Binarize: values above threshold become 1, others become small value (to keep edge)
+    A_new[nonzero_mask] = (A[nonzero_mask] >= threshold).float()
+
+    # Ensure edges still exist (set to small value if below threshold)
+    still_zero = (A_new == 0) & nonzero_mask
+    A_new[still_zero] = 0.1  # Keep edge but with low weight
+
+    return A_new
+
+
+def compute_permutation_pvalue(observed: float, null_distribution: List[float], alternative: str = 'greater') -> float:
+    """
+    Compute proper permutation p-value.
+
+    Args:
+        observed: Observed test statistic
+        null_distribution: List of test statistics under null hypothesis
+        alternative: 'greater' (observed > null), 'less', or 'two-sided'
+
+    Returns:
+        p-value
+    """
+    n = len(null_distribution)
+    null_array = np.array(null_distribution)
+
+    if alternative == 'greater':
+        # p = (1 + #{null >= observed}) / (1 + n)
+        count = np.sum(null_array >= observed)
+    elif alternative == 'less':
+        count = np.sum(null_array <= observed)
+    else:  # two-sided
+        obs_deviation = abs(observed - np.mean(null_array))
+        count = np.sum(np.abs(null_array - np.mean(null_array)) >= obs_deviation)
+
+    p_value = (1 + count) / (1 + n)
+    return p_value
+
+
+@torch.no_grad()
+def run_edge_ablation_experiment(model, test_loader, device, n_permutations=200, random_seed=42):
+    """
+    CORRECTED edge ablation experiment with proper methodology.
+
+    Tests whether learned edge weights are statistically significant by:
+    1. Rebuilding model structures after each adjacency change (mask + PE)
+    2. Using topology-preserving permutations (shuffle only non-zero weights)
+    3. Computing proper permutation p-values
 
     Args:
         model: Trained model
         test_loader: Test data loader
         device: torch device
-        n_permutations: Number of random permutations for statistical testing
+        n_permutations: Number of permutations (recommend >= 200)
+        random_seed: Random seed for reproducibility
 
     Returns:
         Dictionary with ablation results and statistical tests
@@ -741,316 +934,429 @@ def run_edge_ablation_experiment(model, test_loader, device, n_permutations=30):
     results = {}
 
     print(f"\n{'='*70}")
-    print("EDGE ABLATION EXPERIMENT")
+    print("EDGE ABLATION EXPERIMENT (CORRECTED METHODOLOGY)")
     print(f"{'='*70}")
     print(f"Testing significance of learned edge values...")
-    print(f"Running {n_permutations} permutations for statistical testing\n")
+    print(f"Running {n_permutations} permutations for statistical testing")
+    print(f"Methodology: Topology-preserving permutation + proper p-values\n")
 
-    # Store original adjacency and attention mask
+    # Store original adjacency
     original_A = model.A.clone()
-    original_attn_mask = model.attn_mask.clone()
 
-    # 1. Baseline: Learned edges (original)
-    print("Condition 1: Learned edges (baseline)...")
+    # Get edge statistics
+    nonzero_mask = original_A > 0
+    n_edges = nonzero_mask.sum().item() // 2  # Divide by 2 for undirected
+    edge_weights = original_A[nonzero_mask]
+
+    print(f"Graph statistics:")
+    print(f"  Number of pathways: {original_A.size(0)}")
+    print(f"  Number of edges: {n_edges}")
+    print(f"  Edge weight range: [{edge_weights.min():.4f}, {edge_weights.max():.4f}]")
+    print(f"  Edge weight mean: {edge_weights.mean():.4f}")
+    print(f"  Edge weight median: {edge_weights.median():.4f}")
+
+    results['graph_stats'] = {
+        'n_pathways': int(original_A.size(0)),
+        'n_edges': int(n_edges),
+        'weight_min': float(edge_weights.min()),
+        'weight_max': float(edge_weights.max()),
+        'weight_mean': float(edge_weights.mean()),
+        'weight_median': float(edge_weights.median())
+    }
+
+    # ===== CONDITION 1: Baseline (learned edges) =====
+    print(f"\n[1/5] Evaluating LEARNED edges (baseline)...")
+    model.rebuild_from_adjacency(original_A)
     baseline_metrics = evaluate_metrics(model, test_loader, device)
+    baseline_auc = baseline_metrics['auc']
+    baseline_f1 = baseline_metrics['f1_binary']
+
     results['learned'] = {
-        'auc': baseline_metrics['auc'],
-        'f1': baseline_metrics['f1_binary'],
+        'auc': baseline_auc,
+        'f1': baseline_f1,
         'acc': baseline_metrics['acc'],
         'precision': baseline_metrics['precision'],
         'recall': baseline_metrics['recall']
     }
-    print(f"  AUC={baseline_metrics['auc']:.4f}, F1={baseline_metrics['f1_binary']:.4f}")
+    print(f"  AUC = {baseline_auc:.4f}, F1 = {baseline_f1:.4f}")
 
-    # 2. Random edges (multiple runs for statistics)
-    print(f"\nCondition 2: Random edges ({n_permutations} runs)...")
-    random_aucs, random_f1s = [], []
-    for i in tqdm(range(n_permutations), desc="Random edges", leave=False):
-        random_A = torch.rand_like(original_A)
-        random_A = 0.5 * (random_A + random_A.T)  # Symmetrize
-        random_A.fill_diagonal_(0.0)
-        model.A = random_A
+    # ===== CONDITION 2: Topology-preserving SHUFFLED edges =====
+    print(f"\n[2/5] Evaluating SHUFFLED edges ({n_permutations} permutations)...")
+    print(f"  (Shuffling only non-zero edge weights, preserving topology)")
 
-        metrics = evaluate_metrics(model, test_loader, device)
-        random_aucs.append(metrics['auc'])
-        random_f1s.append(metrics['f1_binary'])
+    shuffled_aucs = []
+    shuffled_f1s = []
 
-    results['random'] = {
-        'auc_mean': np.mean(random_aucs),
-        'auc_std': np.std(random_aucs),
-        'f1_mean': np.mean(random_f1s),
-        'f1_std': np.std(random_f1s),
-        'all_aucs': random_aucs,
-        'all_f1s': random_f1s
-    }
-    print(f"  AUC={np.mean(random_aucs):.4f}±{np.std(random_aucs):.4f}, "
-          f"F1={np.mean(random_f1s):.4f}±{np.std(random_f1s):.4f}")
-
-    # 3. Fixed edges (all 0.5)
-    print("\nCondition 3: Fixed edges (all 0.5)...")
-    model.A = torch.full_like(original_A, 0.5)
-    model.A.fill_diagonal_(0.0)
-    fixed_05_metrics = evaluate_metrics(model, test_loader, device)
-    results['fixed_0.5'] = {
-        'auc': fixed_05_metrics['auc'],
-        'f1': fixed_05_metrics['f1_binary']
-    }
-    print(f"  AUC={fixed_05_metrics['auc']:.4f}, F1={fixed_05_metrics['f1_binary']:.4f}")
-
-    # 4. Fixed edges (all 1.0 - fully connected)
-    print("\nCondition 4: Fixed edges (all 1.0 - fully connected)...")
-    model.A = torch.ones_like(original_A)
-    model.A.fill_diagonal_(0.0)
-    fixed_10_metrics = evaluate_metrics(model, test_loader, device)
-    results['fixed_1.0'] = {
-        'auc': fixed_10_metrics['auc'],
-        'f1': fixed_10_metrics['f1_binary']
-    }
-    print(f"  AUC={fixed_10_metrics['auc']:.4f}, F1={fixed_10_metrics['f1_binary']:.4f}")
-
-    # 5. Fixed edges (all 0.0 - no edges)
-    print("\nCondition 5: Fixed edges (all 0.0 - no connections)...")
-    model.A = torch.zeros_like(original_A)
-    fixed_00_metrics = evaluate_metrics(model, test_loader, device)
-    results['fixed_0.0'] = {
-        'auc': fixed_00_metrics['auc'],
-        'f1': fixed_00_metrics['f1_binary']
-    }
-    print(f"  AUC={fixed_00_metrics['auc']:.4f}, F1={fixed_00_metrics['f1_binary']:.4f}")
-
-    # 6. Shuffled edges (permute the learned values)
-    print(f"\nCondition 6: Shuffled edges ({n_permutations} runs)...")
-    shuffled_aucs, shuffled_f1s = [], []
-    flat_A = original_A.flatten()
-    for i in tqdm(range(n_permutations), desc="Shuffled edges", leave=False):
-        perm_idx = torch.randperm(flat_A.size(0), device=device)
-        shuffled_A = flat_A[perm_idx].reshape(original_A.shape)
-        shuffled_A = 0.5 * (shuffled_A + shuffled_A.T)  # Symmetrize
-        shuffled_A.fill_diagonal_(0.0)
-        model.A = shuffled_A
-
+    for i in tqdm(range(n_permutations), desc="  Shuffled permutations", leave=False):
+        shuffled_A = permute_edge_weights_topology_preserving(original_A, seed=random_seed + i)
+        model.rebuild_from_adjacency(shuffled_A)
         metrics = evaluate_metrics(model, test_loader, device)
         shuffled_aucs.append(metrics['auc'])
         shuffled_f1s.append(metrics['f1_binary'])
 
     results['shuffled'] = {
-        'auc_mean': np.mean(shuffled_aucs),
-        'auc_std': np.std(shuffled_aucs),
-        'f1_mean': np.mean(shuffled_f1s),
-        'f1_std': np.std(shuffled_f1s),
+        'auc_mean': float(np.mean(shuffled_aucs)),
+        'auc_std': float(np.std(shuffled_aucs)),
+        'auc_min': float(np.min(shuffled_aucs)),
+        'auc_max': float(np.max(shuffled_aucs)),
+        'f1_mean': float(np.mean(shuffled_f1s)),
+        'f1_std': float(np.std(shuffled_f1s)),
+        'f1_min': float(np.min(shuffled_f1s)),
+        'f1_max': float(np.max(shuffled_f1s)),
         'all_aucs': shuffled_aucs,
         'all_f1s': shuffled_f1s
     }
-    print(f"  AUC={np.mean(shuffled_aucs):.4f}±{np.std(shuffled_aucs):.4f}, "
-          f"F1={np.mean(shuffled_f1s):.4f}±{np.std(shuffled_f1s):.4f}")
+    print(f"  AUC = {np.mean(shuffled_aucs):.4f} ± {np.std(shuffled_aucs):.4f}")
+    print(f"  F1  = {np.mean(shuffled_f1s):.4f} ± {np.std(shuffled_f1s):.4f}")
 
-    # 7. Binary thresholded edges (threshold at 0.5)
-    print("\nCondition 7: Binary edges (threshold at 0.5)...")
-    binary_A = (original_A > 0.5).float()
-    model.A = binary_A
-    binary_metrics = evaluate_metrics(model, test_loader, device)
-    results['binary_0.5'] = {
-        'auc': binary_metrics['auc'],
-        'f1': binary_metrics['f1_binary']
+    # ===== CONDITION 3: Topology-preserving RANDOM edges =====
+    print(f"\n[3/5] Evaluating RANDOM edges ({n_permutations} permutations)...")
+    print(f"  (Random weights in [0.1, 1.0], preserving topology)")
+
+    random_aucs = []
+    random_f1s = []
+
+    for i in tqdm(range(n_permutations), desc="  Random permutations", leave=False):
+        random_A = random_edge_weights_topology_preserving(original_A, seed=random_seed + 10000 + i)
+        model.rebuild_from_adjacency(random_A)
+        metrics = evaluate_metrics(model, test_loader, device)
+        random_aucs.append(metrics['auc'])
+        random_f1s.append(metrics['f1_binary'])
+
+    results['random'] = {
+        'auc_mean': float(np.mean(random_aucs)),
+        'auc_std': float(np.std(random_aucs)),
+        'auc_min': float(np.min(random_aucs)),
+        'auc_max': float(np.max(random_aucs)),
+        'f1_mean': float(np.mean(random_f1s)),
+        'f1_std': float(np.std(random_f1s)),
+        'f1_min': float(np.min(random_f1s)),
+        'f1_max': float(np.max(random_f1s)),
+        'all_aucs': random_aucs,
+        'all_f1s': random_f1s
     }
-    print(f"  AUC={binary_metrics['auc']:.4f}, F1={binary_metrics['f1_binary']:.4f}")
+    print(f"  AUC = {np.mean(random_aucs):.4f} ± {np.std(random_aucs):.4f}")
+    print(f"  F1  = {np.mean(random_f1s):.4f} ± {np.std(random_f1s):.4f}")
 
-    # Restore original
-    model.A = original_A
-    model.attn_mask = original_attn_mask
+    # ===== CONDITION 4: Binary edges (threshold at median) =====
+    print(f"\n[4/5] Evaluating BINARY edges (threshold at median)...")
+    median_threshold = float(edge_weights.median())
+    print(f"  Threshold = {median_threshold:.4f}")
 
-    # === STATISTICAL SIGNIFICANCE TESTS ===
+    binary_A = binarize_edge_weights(original_A, threshold=median_threshold)
+    model.rebuild_from_adjacency(binary_A)
+    binary_metrics = evaluate_metrics(model, test_loader, device)
+
+    results['binary'] = {
+        'auc': binary_metrics['auc'],
+        'f1': binary_metrics['f1_binary'],
+        'threshold': median_threshold
+    }
+    print(f"  AUC = {binary_metrics['auc']:.4f}, F1 = {binary_metrics['f1_binary']:.4f}")
+
+    # ===== CONDITION 5: Uniform edges (all same weight) =====
+    print(f"\n[5/5] Evaluating UNIFORM edges (all edges = mean weight)...")
+    mean_weight = float(edge_weights.mean())
+    uniform_A = torch.zeros_like(original_A)
+    uniform_A[nonzero_mask] = mean_weight
+
+    model.rebuild_from_adjacency(uniform_A)
+    uniform_metrics = evaluate_metrics(model, test_loader, device)
+
+    results['uniform'] = {
+        'auc': uniform_metrics['auc'],
+        'f1': uniform_metrics['f1_binary'],
+        'weight': mean_weight
+    }
+    print(f"  AUC = {uniform_metrics['auc']:.4f}, F1 = {uniform_metrics['f1_binary']:.4f}")
+
+    # Restore original model
+    model.rebuild_from_adjacency(original_A)
+
+    # ===== COMPUTE PERMUTATION P-VALUES =====
     print(f"\n{'='*70}")
-    print("STATISTICAL SIGNIFICANCE TESTS")
+    print("STATISTICAL SIGNIFICANCE (Permutation Tests)")
     print(f"{'='*70}")
 
-    # One-sample t-test: Is learned AUC significantly > mean of random?
-    t_stat_auc_random, p_value_auc_random = stats.ttest_1samp(random_aucs, baseline_metrics['auc'])
-    t_stat_f1_random, p_value_f1_random = stats.ttest_1samp(random_f1s, baseline_metrics['f1_binary'])
+    # Learned vs Shuffled
+    p_auc_shuffled = compute_permutation_pvalue(baseline_auc, shuffled_aucs, alternative='greater')
+    p_f1_shuffled = compute_permutation_pvalue(baseline_f1, shuffled_f1s, alternative='greater')
 
-    # One-tailed: we want learned > random
-    p_auc_random_onetail = p_value_auc_random / 2 if t_stat_auc_random < 0 else 1 - p_value_auc_random / 2
-    p_f1_random_onetail = p_value_f1_random / 2 if t_stat_f1_random < 0 else 1 - p_value_f1_random / 2
-
-    # Same for shuffled
-    t_stat_auc_shuffled, p_value_auc_shuffled = stats.ttest_1samp(shuffled_aucs, baseline_metrics['auc'])
-    t_stat_f1_shuffled, p_value_f1_shuffled = stats.ttest_1samp(shuffled_f1s, baseline_metrics['f1_binary'])
-
-    p_auc_shuffled_onetail = p_value_auc_shuffled / 2 if t_stat_auc_shuffled < 0 else 1 - p_value_auc_shuffled / 2
-    p_f1_shuffled_onetail = p_value_f1_shuffled / 2 if t_stat_f1_shuffled < 0 else 1 - p_value_f1_shuffled / 2
+    # Learned vs Random
+    p_auc_random = compute_permutation_pvalue(baseline_auc, random_aucs, alternative='greater')
+    p_f1_random = compute_permutation_pvalue(baseline_f1, random_f1s, alternative='greater')
 
     results['significance'] = {
-        'learned_vs_random': {
-            'auc_improvement': baseline_metrics['auc'] - np.mean(random_aucs),
-            'f1_improvement': baseline_metrics['f1_binary'] - np.mean(random_f1s),
-            'auc_p_value': float(p_auc_random_onetail),
-            'f1_p_value': float(p_f1_random_onetail),
-            'auc_significant_0.05': p_auc_random_onetail < 0.05,
-            'auc_significant_0.01': p_auc_random_onetail < 0.01,
-            'f1_significant_0.05': p_f1_random_onetail < 0.05,
-            'f1_significant_0.01': p_f1_random_onetail < 0.01
-        },
+        'n_permutations': n_permutations,
         'learned_vs_shuffled': {
-            'auc_improvement': baseline_metrics['auc'] - np.mean(shuffled_aucs),
-            'f1_improvement': baseline_metrics['f1_binary'] - np.mean(shuffled_f1s),
-            'auc_p_value': float(p_auc_shuffled_onetail),
-            'f1_p_value': float(p_f1_shuffled_onetail),
-            'auc_significant_0.05': p_auc_shuffled_onetail < 0.05,
-            'auc_significant_0.01': p_auc_shuffled_onetail < 0.01,
-            'f1_significant_0.05': p_f1_shuffled_onetail < 0.05,
-            'f1_significant_0.01': p_f1_shuffled_onetail < 0.01
+            'auc_improvement': baseline_auc - np.mean(shuffled_aucs),
+            'auc_p_value': p_auc_shuffled,
+            'auc_significant_0.05': p_auc_shuffled < 0.05,
+            'auc_significant_0.01': p_auc_shuffled < 0.01,
+            'f1_improvement': baseline_f1 - np.mean(shuffled_f1s),
+            'f1_p_value': p_f1_shuffled,
+            'f1_significant_0.05': p_f1_shuffled < 0.05,
+            'f1_significant_0.01': p_f1_shuffled < 0.01
+        },
+        'learned_vs_random': {
+            'auc_improvement': baseline_auc - np.mean(random_aucs),
+            'auc_p_value': p_auc_random,
+            'auc_significant_0.05': p_auc_random < 0.05,
+            'auc_significant_0.01': p_auc_random < 0.01,
+            'f1_improvement': baseline_f1 - np.mean(random_f1s),
+            'f1_p_value': p_f1_random,
+            'f1_significant_0.05': p_f1_random < 0.05,
+            'f1_significant_0.01': p_f1_random < 0.01
         }
     }
 
     # Print significance results
-    sig = results['significance']
-
-    print("\nLearned vs Random Edges:")
-    print(f"  AUC improvement: {sig['learned_vs_random']['auc_improvement']:+.4f} "
-          f"(p={sig['learned_vs_random']['auc_p_value']:.4f})")
-    if sig['learned_vs_random']['auc_significant_0.01']:
-        print(f"    → HIGHLY SIGNIFICANT (p < 0.01)")
-    elif sig['learned_vs_random']['auc_significant_0.05']:
-        print(f"    → SIGNIFICANT (p < 0.05)")
+    print(f"\nLearned vs Shuffled (topology-preserving permutation test):")
+    print(f"  AUC: {baseline_auc:.4f} vs {np.mean(shuffled_aucs):.4f} ± {np.std(shuffled_aucs):.4f}")
+    print(f"       Improvement: {baseline_auc - np.mean(shuffled_aucs):+.4f}")
+    print(f"       p-value = {p_auc_shuffled:.4f}", end="")
+    if p_auc_shuffled < 0.01:
+        print(" *** (p < 0.01)")
+    elif p_auc_shuffled < 0.05:
+        print(" *   (p < 0.05)")
     else:
-        print(f"    → NOT SIGNIFICANT (p >= 0.05)")
+        print("     (not significant)")
 
-    print(f"  F1 improvement:  {sig['learned_vs_random']['f1_improvement']:+.4f} "
-          f"(p={sig['learned_vs_random']['f1_p_value']:.4f})")
-    if sig['learned_vs_random']['f1_significant_0.01']:
-        print(f"    → HIGHLY SIGNIFICANT (p < 0.01)")
-    elif sig['learned_vs_random']['f1_significant_0.05']:
-        print(f"    → SIGNIFICANT (p < 0.05)")
+    print(f"  F1:  {baseline_f1:.4f} vs {np.mean(shuffled_f1s):.4f} ± {np.std(shuffled_f1s):.4f}")
+    print(f"       Improvement: {baseline_f1 - np.mean(shuffled_f1s):+.4f}")
+    print(f"       p-value = {p_f1_shuffled:.4f}", end="")
+    if p_f1_shuffled < 0.01:
+        print(" *** (p < 0.01)")
+    elif p_f1_shuffled < 0.05:
+        print(" *   (p < 0.05)")
     else:
-        print(f"    → NOT SIGNIFICANT (p >= 0.05)")
+        print("     (not significant)")
 
-    print("\nLearned vs Shuffled Edges:")
-    print(f"  AUC improvement: {sig['learned_vs_shuffled']['auc_improvement']:+.4f} "
-          f"(p={sig['learned_vs_shuffled']['auc_p_value']:.4f})")
-    if sig['learned_vs_shuffled']['auc_significant_0.01']:
-        print(f"    → HIGHLY SIGNIFICANT (p < 0.01)")
-    elif sig['learned_vs_shuffled']['auc_significant_0.05']:
-        print(f"    → SIGNIFICANT (p < 0.05)")
+    print(f"\nLearned vs Random (topology-preserving random weights):")
+    print(f"  AUC: {baseline_auc:.4f} vs {np.mean(random_aucs):.4f} ± {np.std(random_aucs):.4f}")
+    print(f"       Improvement: {baseline_auc - np.mean(random_aucs):+.4f}")
+    print(f"       p-value = {p_auc_random:.4f}", end="")
+    if p_auc_random < 0.01:
+        print(" *** (p < 0.01)")
+    elif p_auc_random < 0.05:
+        print(" *   (p < 0.05)")
     else:
-        print(f"    → NOT SIGNIFICANT (p >= 0.05)")
+        print("     (not significant)")
 
-    print(f"  F1 improvement:  {sig['learned_vs_shuffled']['f1_improvement']:+.4f} "
-          f"(p={sig['learned_vs_shuffled']['f1_p_value']:.4f})")
-    if sig['learned_vs_shuffled']['f1_significant_0.01']:
-        print(f"    → HIGHLY SIGNIFICANT (p < 0.01)")
-    elif sig['learned_vs_shuffled']['f1_significant_0.05']:
-        print(f"    → SIGNIFICANT (p < 0.05)")
+    print(f"  F1:  {baseline_f1:.4f} vs {np.mean(random_f1s):.4f} ± {np.std(random_f1s):.4f}")
+    print(f"       Improvement: {baseline_f1 - np.mean(random_f1s):+.4f}")
+    print(f"       p-value = {p_f1_random:.4f}", end="")
+    if p_f1_random < 0.01:
+        print(" *** (p < 0.01)")
+    elif p_f1_random < 0.05:
+        print(" *   (p < 0.05)")
     else:
-        print(f"    → NOT SIGNIFICANT (p >= 0.05)")
+        print("     (not significant)")
 
     print(f"\n{'='*70}\n")
 
     return results
 
 
-def visualize_edge_ablation(results, save_path):
-    """Create visualization of ablation results"""
+def visualize_edge_ablation(results: Dict, save_path: str):
+    """Create publication-quality visualization of ablation results"""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Prepare data
-    conditions = ['Learned', 'Random', 'Shuffled', 'Fixed(0)', 'Fixed(0.5)', 'Fixed(1)', 'Binary']
+    # Conditions and data
+    conditions = ['Learned', 'Shuffled', 'Random', 'Binary', 'Uniform']
 
     auc_means = [
         results['learned']['auc'],
-        results['random']['auc_mean'],
         results['shuffled']['auc_mean'],
-        results['fixed_0.0']['auc'],
-        results['fixed_0.5']['auc'],
-        results['fixed_1.0']['auc'],
-        results['binary_0.5']['auc']
+        results['random']['auc_mean'],
+        results['binary']['auc'],
+        results['uniform']['auc']
     ]
     auc_stds = [
         0,
-        results['random']['auc_std'],
         results['shuffled']['auc_std'],
-        0, 0, 0, 0
+        results['random']['auc_std'],
+        0,
+        0
     ]
 
     f1_means = [
         results['learned']['f1'],
-        results['random']['f1_mean'],
         results['shuffled']['f1_mean'],
-        results['fixed_0.0']['f1'],
-        results['fixed_0.5']['f1'],
-        results['fixed_1.0']['f1'],
-        results['binary_0.5']['f1']
+        results['random']['f1_mean'],
+        results['binary']['f1'],
+        results['uniform']['f1']
     ]
     f1_stds = [
         0,
-        results['random']['f1_std'],
         results['shuffled']['f1_std'],
-        0, 0, 0, 0
+        results['random']['f1_std'],
+        0,
+        0
     ]
 
-    colors = ['green', 'red', 'orange', 'gray', 'blue', 'purple', 'brown']
+    colors = ['#2ecc71', '#e74c3c', '#f39c12', '#3498db', '#9b59b6']
+    x = np.arange(len(conditions))
 
     # AUC plot
-    x = np.arange(len(conditions))
-    bars1 = axes[0].bar(x, auc_means, yerr=auc_stds, capsize=5, color=colors, alpha=0.7, edgecolor='black')
-    axes[0].set_ylabel('AUC', fontsize=12)
-    axes[0].set_title('AUC by Edge Condition', fontsize=14, weight='bold')
+    bars1 = axes[0].bar(x, auc_means, yerr=auc_stds, capsize=5, color=colors,
+                        alpha=0.8, edgecolor='black', linewidth=1.5)
+    axes[0].set_ylabel('AUC', fontsize=14)
+    axes[0].set_title('AUC by Edge Condition', fontsize=16, weight='bold')
     axes[0].set_xticks(x)
-    axes[0].set_xticklabels(conditions, rotation=45, ha='right')
-    axes[0].axhline(y=results['learned']['auc'], color='green', linestyle='--', alpha=0.5, label='Learned baseline')
-    axes[0].legend()
+    axes[0].set_xticklabels(conditions, rotation=45, ha='right', fontsize=12)
+    axes[0].axhline(y=results['learned']['auc'], color='#2ecc71', linestyle='--',
+                    alpha=0.7, linewidth=2, label='Learned baseline')
+    axes[0].legend(loc='lower right')
+    axes[0].grid(axis='y', alpha=0.3)
 
-    # Add significance markers
+    # Add significance markers for AUC
     sig = results.get('significance', {})
-    if sig.get('learned_vs_random', {}).get('auc_significant_0.05'):
-        axes[0].annotate('*', xy=(1, auc_means[1] + auc_stds[1] + 0.02), ha='center', fontsize=16, color='red')
-    if sig.get('learned_vs_shuffled', {}).get('auc_significant_0.05'):
-        axes[0].annotate('*', xy=(2, auc_means[2] + auc_stds[2] + 0.02), ha='center', fontsize=16, color='red')
+    if sig.get('learned_vs_shuffled', {}).get('auc_significant_0.01'):
+        axes[0].annotate('***', xy=(1, auc_means[1] + auc_stds[1] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
+    elif sig.get('learned_vs_shuffled', {}).get('auc_significant_0.05'):
+        axes[0].annotate('*', xy=(1, auc_means[1] + auc_stds[1] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
+
+    if sig.get('learned_vs_random', {}).get('auc_significant_0.01'):
+        axes[0].annotate('***', xy=(2, auc_means[2] + auc_stds[2] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
+    elif sig.get('learned_vs_random', {}).get('auc_significant_0.05'):
+        axes[0].annotate('*', xy=(2, auc_means[2] + auc_stds[2] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
 
     # F1 plot
-    bars2 = axes[1].bar(x, f1_means, yerr=f1_stds, capsize=5, color=colors, alpha=0.7, edgecolor='black')
-    axes[1].set_ylabel('F1 Score', fontsize=12)
-    axes[1].set_title('F1 Score by Edge Condition', fontsize=14, weight='bold')
+    bars2 = axes[1].bar(x, f1_means, yerr=f1_stds, capsize=5, color=colors,
+                        alpha=0.8, edgecolor='black', linewidth=1.5)
+    axes[1].set_ylabel('F1 Score', fontsize=14)
+    axes[1].set_title('F1 Score by Edge Condition', fontsize=16, weight='bold')
     axes[1].set_xticks(x)
-    axes[1].set_xticklabels(conditions, rotation=45, ha='right')
-    axes[1].axhline(y=results['learned']['f1'], color='green', linestyle='--', alpha=0.5, label='Learned baseline')
-    axes[1].legend()
+    axes[1].set_xticklabels(conditions, rotation=45, ha='right', fontsize=12)
+    axes[1].axhline(y=results['learned']['f1'], color='#2ecc71', linestyle='--',
+                    alpha=0.7, linewidth=2, label='Learned baseline')
+    axes[1].legend(loc='lower right')
+    axes[1].grid(axis='y', alpha=0.3)
 
-    # Add significance markers
-    if sig.get('learned_vs_random', {}).get('f1_significant_0.05'):
-        axes[1].annotate('*', xy=(1, f1_means[1] + f1_stds[1] + 0.02), ha='center', fontsize=16, color='red')
-    if sig.get('learned_vs_shuffled', {}).get('f1_significant_0.05'):
-        axes[1].annotate('*', xy=(2, f1_means[2] + f1_stds[2] + 0.02), ha='center', fontsize=16, color='red')
+    # Add significance markers for F1
+    if sig.get('learned_vs_shuffled', {}).get('f1_significant_0.01'):
+        axes[1].annotate('***', xy=(1, f1_means[1] + f1_stds[1] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
+    elif sig.get('learned_vs_shuffled', {}).get('f1_significant_0.05'):
+        axes[1].annotate('*', xy=(1, f1_means[1] + f1_stds[1] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
+
+    if sig.get('learned_vs_random', {}).get('f1_significant_0.01'):
+        axes[1].annotate('***', xy=(2, f1_means[2] + f1_stds[2] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
+    elif sig.get('learned_vs_random', {}).get('f1_significant_0.05'):
+        axes[1].annotate('*', xy=(2, f1_means[2] + f1_stds[2] + 0.02),
+                        ha='center', fontsize=14, weight='bold')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"Ablation visualization saved to: {save_path}")
+    print(f"Ablation bar chart saved to: {save_path}")
 
 
-def visualize_edge_distribution(model, save_path):
+def visualize_permutation_distribution(results: Dict, save_path: str):
+    """Create histogram of permutation null distributions with observed value"""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    baseline_auc = results['learned']['auc']
+    baseline_f1 = results['learned']['f1']
+
+    # Shuffled AUC distribution
+    ax = axes[0, 0]
+    ax.hist(results['shuffled']['all_aucs'], bins=30, color='#e74c3c', alpha=0.7,
+            edgecolor='black', label='Shuffled null')
+    ax.axvline(baseline_auc, color='#2ecc71', linewidth=3, linestyle='--',
+               label=f'Learned: {baseline_auc:.4f}')
+    p_val = results['significance']['learned_vs_shuffled']['auc_p_value']
+    ax.set_title(f'Shuffled Permutation Test (AUC)\np = {p_val:.4f}', fontsize=14, weight='bold')
+    ax.set_xlabel('AUC', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # Shuffled F1 distribution
+    ax = axes[0, 1]
+    ax.hist(results['shuffled']['all_f1s'], bins=30, color='#e74c3c', alpha=0.7,
+            edgecolor='black', label='Shuffled null')
+    ax.axvline(baseline_f1, color='#2ecc71', linewidth=3, linestyle='--',
+               label=f'Learned: {baseline_f1:.4f}')
+    p_val = results['significance']['learned_vs_shuffled']['f1_p_value']
+    ax.set_title(f'Shuffled Permutation Test (F1)\np = {p_val:.4f}', fontsize=14, weight='bold')
+    ax.set_xlabel('F1 Score', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # Random AUC distribution
+    ax = axes[1, 0]
+    ax.hist(results['random']['all_aucs'], bins=30, color='#f39c12', alpha=0.7,
+            edgecolor='black', label='Random null')
+    ax.axvline(baseline_auc, color='#2ecc71', linewidth=3, linestyle='--',
+               label=f'Learned: {baseline_auc:.4f}')
+    p_val = results['significance']['learned_vs_random']['auc_p_value']
+    ax.set_title(f'Random Weights Test (AUC)\np = {p_val:.4f}', fontsize=14, weight='bold')
+    ax.set_xlabel('AUC', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # Random F1 distribution
+    ax = axes[1, 1]
+    ax.hist(results['random']['all_f1s'], bins=30, color='#f39c12', alpha=0.7,
+            edgecolor='black', label='Random null')
+    ax.axvline(baseline_f1, color='#2ecc71', linewidth=3, linestyle='--',
+               label=f'Learned: {baseline_f1:.4f}')
+    p_val = results['significance']['learned_vs_random']['f1_p_value']
+    ax.set_title(f'Random Weights Test (F1)\np = {p_val:.4f}', fontsize=14, weight='bold')
+    ax.set_xlabel('F1 Score', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    plt.suptitle('Permutation Null Distributions', fontsize=16, weight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Permutation distributions saved to: {save_path}")
+
+
+def visualize_edge_distribution(model, save_path: str):
     """Visualize the distribution of learned edge values"""
     A = model.A.cpu().numpy()
 
-    # Get upper triangle (excluding diagonal)
-    upper_tri = A[np.triu_indices_from(A, k=1)]
+    # Get upper triangle (excluding diagonal) non-zero values
+    rows, cols = np.triu_indices_from(A, k=1)
+    upper_tri = A[rows, cols]
+    nonzero_weights = upper_tri[upper_tri > 0]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Histogram of edge values
-    axes[0].hist(upper_tri, bins=50, color='steelblue', edgecolor='black', alpha=0.7)
-    axes[0].set_xlabel('Edge Value', fontsize=12)
-    axes[0].set_ylabel('Frequency', fontsize=12)
-    axes[0].set_title('Distribution of Learned Edge Values', fontsize=14, weight='bold')
-    axes[0].axvline(x=np.mean(upper_tri), color='red', linestyle='--', label=f'Mean: {np.mean(upper_tri):.3f}')
-    axes[0].axvline(x=np.median(upper_tri), color='orange', linestyle='--', label=f'Median: {np.median(upper_tri):.3f}')
-    axes[0].legend()
+    # Histogram of non-zero edge values
+    ax = axes[0]
+    if len(nonzero_weights) > 0:
+        ax.hist(nonzero_weights, bins=50, color='steelblue', edgecolor='black', alpha=0.7)
+        ax.axvline(np.mean(nonzero_weights), color='red', linestyle='--', linewidth=2,
+                   label=f'Mean: {np.mean(nonzero_weights):.3f}')
+        ax.axvline(np.median(nonzero_weights), color='orange', linestyle='--', linewidth=2,
+                   label=f'Median: {np.median(nonzero_weights):.3f}')
+        ax.legend()
+    ax.set_xlabel('Edge Weight', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_title('Distribution of Non-Zero Edge Weights', fontsize=14, weight='bold')
+    ax.grid(alpha=0.3)
 
     # Heatmap of edge values
-    im = axes[1].imshow(A, cmap='viridis', aspect='auto')
-    axes[1].set_xlabel('Pathway Index', fontsize=12)
-    axes[1].set_ylabel('Pathway Index', fontsize=12)
-    axes[1].set_title('Learned Edge Matrix (Adjacency)', fontsize=14, weight='bold')
-    plt.colorbar(im, ax=axes[1], label='Edge Value')
+    ax = axes[1]
+    im = ax.imshow(A, cmap='viridis', aspect='auto')
+    ax.set_xlabel('Pathway Index', fontsize=12)
+    ax.set_ylabel('Pathway Index', fontsize=12)
+    ax.set_title('Learned Edge Matrix (Adjacency)', fontsize=14, weight='bold')
+    plt.colorbar(im, ax=ax, label='Edge Weight')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -1427,7 +1733,7 @@ def main_5fold_cv():
                     help="Use fully connected graph instead of sparse adjacency")
     ap.add_argument("--run_ablation", action='store_true', default=True,
                     help="Run edge ablation experiment after training")
-    ap.add_argument("--ablation_permutations", type=int, default=30,
+    ap.add_argument("--ablation_permutations", type=int, default=200,
                     help="Number of permutations for ablation statistical tests")
 
     args = ap.parse_args()
