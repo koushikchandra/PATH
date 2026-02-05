@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os, re, json, math, argparse, random
 from typing import List, Tuple, Optional, Dict
 import numpy as np
