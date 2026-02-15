@@ -1044,9 +1044,18 @@ def main_5fold_cv():
     ap.add_argument("--use_batch_norm", action='store_true', default=True)
     ap.add_argument("--pe_dim", type=int, default=16)
     ap.add_argument("--use_edge_aware_blocks", action='store_true', default=True)
-    ap.add_argument("--use_full_graph", action='store_true', 
+    ap.add_argument("--use_full_graph", action='store_true',
                     help="Use fully connected graph (all pathways attend to all) instead of sparse adjacency")
-    
+    ap.add_argument("--early_stopping_metric", default="f1_binary",
+                    choices=["auc", "f1_binary", "aupr", "acc"],
+                    help="Metric to use for early stopping and model selection (default: f1_binary)")
+    ap.add_argument("--use_lr_scheduler", action='store_true', default=True,
+                    help="Use ReduceLROnPlateau learning rate scheduler")
+    ap.add_argument("--lr_scheduler_patience", type=int, default=10,
+                    help="Patience for learning rate scheduler")
+    ap.add_argument("--lr_scheduler_factor", type=float, default=0.5,
+                    help="Factor to reduce learning rate by")
+
     args = ap.parse_args()
 
     print(f"\n{'='*70}")
@@ -1055,6 +1064,9 @@ def main_5fold_cv():
     print(f"Model: Improved Graph Transformer (Dwivedi & Bresson)")
     print(f"CV Strategy: 5-Fold Stratified (1 fold test, 4 folds train, 10% of train as val)")
     print(f"Expected splits per fold: ~72% train, ~8% val, ~20% test")
+    print(f"Early Stopping Metric: {args.early_stopping_metric.upper()}")
+    print(f"Learning Rate Scheduler: {'ENABLED' if args.use_lr_scheduler else 'DISABLED'}")
+    print(f"Focal Loss: {'ENABLED' if args.use_focal_loss else 'DISABLED'}")
     print(f"{'='*70}\n")
     
     os.makedirs(args.outdir, exist_ok=True)
@@ -1152,6 +1164,19 @@ def main_5fold_cv():
         # Optimizer and loss
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+        # Learning rate scheduler
+        scheduler = None
+        if args.use_lr_scheduler:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt,
+                mode='max',
+                factor=args.lr_scheduler_factor,
+                patience=args.lr_scheduler_patience,
+                verbose=True,
+                min_lr=1e-7
+            )
+            print(f"Using ReduceLROnPlateau scheduler (patience={args.lr_scheduler_patience}, factor={args.lr_scheduler_factor})")
+
         classes = np.unique(y_tr.numpy())
         weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_tr.numpy())
         weights = torch.tensor(weights, dtype=torch.float32).to(device)
@@ -1168,11 +1193,14 @@ def main_5fold_cv():
         best_threshold = 0.5  # Store best threshold from validation set
 
         # Training loop
+        metric_name = args.early_stopping_metric.upper()
         print(f"\nTraining fold {fold}...")
+        print(f"Early stopping criterion: {metric_name}")
+
         for epoch in range(1, args.epochs + 1):
             tr_loss = train_one_epoch(model, train_loader, opt, criterion, device)
             val_metrics = evaluate_metrics(model, val_loader, device)
-            val_metric = val_metrics["auc"]
+            val_metric = val_metrics[args.early_stopping_metric]  # Use configurable metric
 
             if val_metric > best_val_metric:
                 best_val_metric = val_metric
@@ -1184,10 +1212,15 @@ def main_5fold_cv():
 
             else:
                 epochs_no_improve += 1
-            
+
+            # Learning rate scheduler step
+            if scheduler is not None:
+                scheduler.step(val_metric)
+
             if epoch % 10 == 0 or epoch <= 5:
-                print(f"Epoch {epoch:3d} | Loss: {tr_loss:.4f} | Val AUC: {val_metric:.4f} | "
-                      f"Patience: {epochs_no_improve}/{args.patience}")
+                current_lr = opt.param_groups[0]['lr']
+                print(f"Epoch {epoch:3d} | Loss: {tr_loss:.4f} | Val {metric_name}: {val_metric:.4f} | "
+                      f"LR: {current_lr:.2e} | Patience: {epochs_no_improve}/{args.patience}")
             
             if epoch >= args.min_epochs and epochs_no_improve >= args.patience:
                 print(f"\nEarly stopping at epoch {epoch}")
