@@ -842,6 +842,59 @@ def evaluate_metrics(model, loader, device):
         "f1_binary": f1_binary,
         "precision": precision,
         "recall": recall,
+        "best_threshold": best_thr,
+        "y_true": y_true,
+        "y_pred": pred,
+        "y_probs": p1
+    }
+
+@torch.no_grad()
+def evaluate_metrics_with_threshold(model, loader, device, threshold):
+    """
+    Evaluate model using a FIXED threshold (no optimization on this data).
+    Use this for test set evaluation to avoid data leakage.
+
+    Args:
+        model: The model to evaluate
+        loader: DataLoader for the dataset
+        device: torch device
+        threshold: Fixed threshold value (determined from validation set)
+
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    model.eval()
+    all_y, all_p1 = [], []
+    pbar = tqdm(loader, desc="Evaluating", leave=False, ncols=80)
+    for mut_b, cnv_b, y_b in pbar:
+        mut_b, cnv_b, y_b = mut_b.to(device), cnv_b.to(device), y_b.to(device)
+        logits = model(mut_b, cnv_b)
+        probs = logits.softmax(dim=-1)[:,1]
+        all_y.append(y_b.cpu().numpy())
+        all_p1.append(probs.cpu().numpy())
+
+    y_true = np.concatenate(all_y) if all_y else np.array([])
+    p1 = np.concatenate(all_p1) if all_p1 else np.array([])
+
+    # Use FIXED threshold (no optimization on this data)
+    pred = (p1 >= threshold).astype(int)
+
+    acc = accuracy_score(y_true, pred)
+    auc = roc_auc_score(y_true, p1) if y_true.size>0 and len(np.unique(y_true))>1 else float("nan")
+    aupr = average_precision_score(y_true, p1) if y_true.size>0 and len(np.unique(y_true))>1 else float("nan")
+
+    f1_binary = f1_score(y_true, pred, average='binary', zero_division=0)
+    precision = precision_score(y_true, pred, average='binary', zero_division=0)
+    recall = recall_score(y_true, pred, average='binary', zero_division=0)
+
+    return {
+        "acc": acc,
+        "auc": auc,
+        "aupr": aupr,
+        "f1_binary": f1_binary,
+        "precision": precision,
+        "recall": recall,
+        "threshold": threshold,
         "y_true": y_true,
         "y_pred": pred,
         "y_probs": p1
@@ -1112,20 +1165,22 @@ def main_5fold_cv():
         epochs_no_improve = 0
         best_epoch = 0
         best_model_state = None
-        
+        best_threshold = 0.5  # Store best threshold from validation set
+
         # Training loop
         print(f"\nTraining fold {fold}...")
         for epoch in range(1, args.epochs + 1):
             tr_loss = train_one_epoch(model, train_loader, opt, criterion, device)
             val_metrics = evaluate_metrics(model, val_loader, device)
             val_metric = val_metrics["auc"]
-            
+
             if val_metric > best_val_metric:
                 best_val_metric = val_metric
                 epochs_no_improve = 0
                 best_epoch = epoch
-                # best_model_state = model.state_dict().copy()
-                best_model_state = copy.deepcopy(model.state_dict())  # ✓ CORRECT
+                best_model_state = copy.deepcopy(model.state_dict())
+                # IMPORTANT: Save threshold determined on validation set
+                best_threshold = val_metrics["best_threshold"]
 
             else:
                 epochs_no_improve += 1
@@ -1143,16 +1198,14 @@ def main_5fold_cv():
             best_model_path = os.path.join(args.outdir, f"best_model_fold{fold}.pt")
             torch.save(best_model_state, best_model_path)
             model.load_state_dict(best_model_state)
-        
+
+        # Evaluate validation set to get final validation metrics
         final_val_metrics = evaluate_metrics(model, val_loader, device)
-        test_metrics = evaluate_metrics(model, test_loader, device)
-        
-        # Load best model and evaluate
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
-        
-        final_val_metrics = evaluate_metrics(model, val_loader, device)
-        test_metrics = evaluate_metrics(model, test_loader, device)
+
+        # CRITICAL: Use FIXED threshold from validation set for test evaluation
+        # This prevents data leakage and gives unbiased test performance
+        print(f"\nUsing threshold={best_threshold:.4f} (from validation set) for test evaluation")
+        test_metrics = evaluate_metrics_with_threshold(model, test_loader, device, best_threshold)
         
         # ===== ADD THIS SECTION =====
         # Analyze pathway importance for this fold
@@ -1185,20 +1238,21 @@ def main_5fold_cv():
         all_fold_predictions.append(fold_predictions_df)
         
         print(f"\nFold {fold} Complete!")
-        print(f"   Val:  AUC={final_val_metrics['auc']:.4f}, F1={final_val_metrics['f1_binary']:.4f}")
+        print(f"   Val:  AUC={final_val_metrics['auc']:.4f}, F1={final_val_metrics['f1_binary']:.4f}, Threshold={best_threshold:.4f}")
         print(f"   Test: AUC={test_metrics['auc']:.4f}, F1={test_metrics['f1_binary']:.4f}, Acc={test_metrics['acc']:.4f}")
-        
+
         # Clean metrics before storing
-        test_metrics_clean = {k: v for k, v in test_metrics.items() 
+        test_metrics_clean = {k: v for k, v in test_metrics.items()
                              if k not in ['y_true', 'y_pred', 'y_probs']}
-        val_metrics_clean = {k: v for k, v in final_val_metrics.items() 
+        val_metrics_clean = {k: v for k, v in final_val_metrics.items()
                             if k not in ['y_true', 'y_pred', 'y_probs']}
-        
+
         all_fold_val_metrics.append(val_metrics_clean)
         all_fold_test_metrics.append(test_metrics_clean)
         all_fold_details.append({
             'fold': fold,
             'best_epoch': best_epoch,
+            'best_threshold': best_threshold,
             'val_metrics': val_metrics_clean,
             'test_metrics': test_metrics_clean
         })
@@ -1222,7 +1276,14 @@ def main_5fold_cv():
     for detail in all_fold_details:
         print(f"Fold {detail['fold']}: Val AUC={detail['val_metrics']['auc']:.4f}, "
               f"Test AUC={detail['test_metrics']['auc']:.4f}, "
-              f"Test F1={detail['test_metrics']['f1_binary']:.4f}")
+              f"Test F1={detail['test_metrics']['f1_binary']:.4f}, "
+              f"Threshold={detail['best_threshold']:.4f}")
+
+    # Display threshold statistics
+    thresholds = [d['best_threshold'] for d in all_fold_details]
+    print(f"\nTHRESHOLD STATISTICS (determined from validation sets):")
+    print(f"  Mean Threshold: {np.mean(thresholds):.4f} ± {np.std(thresholds):.4f}")
+    print(f"  Range: [{np.min(thresholds):.4f}, {np.max(thresholds):.4f}]")
 
     # Generate aggregate visualizations
     print(f"\nGenerating aggregate visualizations...")
