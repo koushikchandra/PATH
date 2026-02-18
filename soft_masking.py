@@ -991,6 +991,8 @@ def compute_omic_contributions(model, loader, pathway_gene_lists, device):
         mut_pathway_scores: np.ndarray [num_pathways] – mutation attribution per pathway
         cnv_pathway_scores: np.ndarray [num_pathways] – CNV attribution per pathway
         omic_dominance:     np.ndarray [num_pathways] – ratio mut/(mut+cnv+eps)
+        mut_gene_scores:    np.ndarray [num_genes]    – mutation attribution per gene
+        cnv_gene_scores:    np.ndarray [num_genes]    – CNV attribution per gene
     """
     model.eval()
     mut_attrs_all = []
@@ -1028,7 +1030,217 @@ def compute_omic_contributions(model, loader, pathway_gene_lists, device):
     total = mut_pathway + cnv_pathway + 1e-12
     omic_dominance = mut_pathway / total   # >0.5 → mut-dominant, <0.5 → cnv-dominant
 
-    return mut_pathway, cnv_pathway, omic_dominance
+    return mut_pathway, cnv_pathway, omic_dominance, mut_gene, cnv_gene
+
+
+def analyze_and_save_gene_importance(mut_gene_scores, cnv_gene_scores, gene_cols,
+                                     outdir, fold_num, top_k=20):
+    """
+    Identify the top genes driving metastatic progression.
+
+    Ranks genes by total Gradient×Input attribution (mut + cnv) and reports
+    how much of each gene's signal comes from mutation vs CNV.
+
+    Args:
+        mut_gene_scores: np.ndarray [num_genes] – per-gene mutation attribution
+        cnv_gene_scores: np.ndarray [num_genes] – per-gene CNV attribution
+        gene_cols: List of gene names (same order as columns in mut/cnv matrices)
+        outdir: Root output directory
+        fold_num: Current fold number
+        top_k: How many top genes to display and save (default 20)
+
+    Returns:
+        Dictionary with top gene rankings and all gene rankings
+    """
+    gene_dir = os.path.join(outdir, "gene_importance")
+    os.makedirs(gene_dir, exist_ok=True)
+
+    total_gene = mut_gene_scores + cnv_gene_scores          # [G]
+    gene_ranking = np.argsort(-total_gene)                  # descending
+
+    print(f"\n{'='*70}")
+    print(f"GENE IMPORTANCE ANALYSIS - FOLD {fold_num}")
+    print(f"{'='*70}")
+    print(f"\nTop {top_k} Genes for Metastatic Progression:")
+    print("-" * 105)
+    print(f"{'Rank':<6} {'Gene':<20} {'Total Attr':<16} {'Mut Attr':<16} {'CNV Attr':<16} "
+          f"{'Mut%':<8} {'CNV%':<8} {'Dominant'}")
+    print("-" * 105)
+
+    top_gene_results = []
+    for rank, idx in enumerate(gene_ranking[:top_k], 1):
+        gene_name = gene_cols[idx] if idx < len(gene_cols) else f"Gene_{idx}"
+        total  = float(total_gene[idx])
+        m_s    = float(mut_gene_scores[idx])
+        c_s    = float(cnv_gene_scores[idx])
+        dom    = m_s / (total + 1e-12)
+        dominant = "MUT" if dom >= 0.5 else "CNV"
+        mut_pct = dom * 100
+        cnv_pct = (1 - dom) * 100
+
+        print(f"{rank:<6} {gene_name:<20} {total:<16.8f} {m_s:<16.8f} {c_s:<16.8f} "
+              f"{mut_pct:<8.1f} {cnv_pct:<8.1f} {dominant}")
+
+        top_gene_results.append({
+            'rank': rank,
+            'gene_idx': int(idx),
+            'gene_name': gene_name,
+            'total_attribution': total,
+            'mut_attribution': m_s,
+            'cnv_attribution': c_s,
+            'mut_pct': round(mut_pct, 2),
+            'cnv_pct': round(cnv_pct, 2),
+            'omic_dominant': dominant
+        })
+
+    # Build full ranking for CSV (all genes)
+    all_gene_rankings = []
+    for rank, idx in enumerate(gene_ranking, 1):
+        gene_name = gene_cols[idx] if idx < len(gene_cols) else f"Gene_{idx}"
+        total  = float(total_gene[idx])
+        m_s    = float(mut_gene_scores[idx])
+        c_s    = float(cnv_gene_scores[idx])
+        dom    = m_s / (total + 1e-12)
+        all_gene_rankings.append({
+            'fold': fold_num,
+            'rank': rank,
+            'gene_idx': int(idx),
+            'gene_name': gene_name,
+            'total_attribution': total,
+            'mut_attribution': m_s,
+            'cnv_attribution': c_s,
+            'mut_pct': round(dom * 100, 2),
+            'cnv_pct': round((1 - dom) * 100, 2),
+            'omic_dominant': "MUT" if dom >= 0.5 else "CNV"
+        })
+
+    # Save full CSV
+    csv_file = os.path.join(gene_dir, f"gene_importance_fold{fold_num}.csv")
+    pd.DataFrame(all_gene_rankings).to_csv(csv_file, index=False)
+    print(f"\nComplete gene rankings saved to: {csv_file}")
+
+    # Save top-k JSON
+    json_file = os.path.join(gene_dir, f"top_genes_fold{fold_num}.json")
+    with open(json_file, 'w') as f:
+        json.dump({
+            'fold': fold_num,
+            'top_genes': top_gene_results,
+            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }, f, indent=2)
+    print(f"Top {top_k} genes saved to: {json_file}")
+
+    return {'fold': fold_num, 'top_genes': top_gene_results, 'all_gene_rankings': all_gene_rankings}
+
+
+def aggregate_gene_rankings_across_folds(outdir, n_folds=5):
+    """
+    Aggregate gene importance rankings across all CV folds.
+
+    Reads per-fold gene_importance CSVs, groups by gene, computes mean/std
+    of total, mut, and cnv attribution, derives omic dominance, and saves
+    the aggregate ranking.
+
+    Args:
+        outdir: Root output directory (same as passed to main)
+        n_folds: Number of CV folds
+
+    Returns:
+        DataFrame with aggregate gene statistics, or None if no data found
+    """
+    gene_dir = os.path.join(outdir, "gene_importance")
+    if not os.path.exists(gene_dir):
+        print(f"Warning: Gene importance directory not found: {gene_dir}")
+        return None
+
+    print(f"\n{'='*70}")
+    print("AGGREGATING GENE IMPORTANCE ACROSS ALL FOLDS")
+    print(f"{'='*70}")
+
+    all_fold_data = []
+    for fold in range(1, n_folds + 1):
+        csv_file = os.path.join(gene_dir, f"gene_importance_fold{fold}.csv")
+        if os.path.exists(csv_file):
+            df = pd.read_csv(csv_file)
+            all_fold_data.append(df)
+            print(f"Loaded fold {fold} gene data: {len(df)} genes")
+        else:
+            print(f"Warning: Missing fold {fold} data: {csv_file}")
+
+    if not all_fold_data:
+        print("Error: No gene fold data found!")
+        return None
+
+    combined_df = pd.concat(all_fold_data, ignore_index=True)
+
+    gene_stats = combined_df.groupby('gene_idx').agg(
+        gene_name=('gene_name', 'first'),
+        mean_total=('total_attribution', 'mean'),
+        std_total=('total_attribution', 'std'),
+        mean_mut=('mut_attribution', 'mean'),
+        std_mut=('mut_attribution', 'std'),
+        mean_cnv=('cnv_attribution', 'mean'),
+        std_cnv=('cnv_attribution', 'std'),
+        mean_rank=('rank', 'mean'),
+        std_rank=('rank', 'std')
+    ).reset_index()
+
+    gene_stats = gene_stats.sort_values('mean_total', ascending=False).reset_index(drop=True)
+    gene_stats['overall_rank'] = range(1, len(gene_stats) + 1)
+
+    total = gene_stats['mean_mut'] + gene_stats['mean_cnv'] + 1e-12
+    gene_stats['mean_mut_pct'] = (gene_stats['mean_mut'] / total * 100).round(2)
+    gene_stats['mean_cnv_pct'] = (gene_stats['mean_cnv'] / total * 100).round(2)
+    gene_stats['omic_dominant'] = gene_stats['mean_mut_pct'].apply(
+        lambda x: 'MUT' if x >= 50.0 else 'CNV'
+    )
+
+    # Display top 20
+    print(f"\nTop 20 Genes for Metastatic Progression (Across {n_folds} Folds):")
+    print("-" * 120)
+    print(f"{'Rank':<6} {'Gene':<20} {'Mean Total Attr':<22} {'Mean Mut Attr':<20} "
+          f"{'Mean CNV Attr':<20} {'Mut%':<8} {'CNV%':<8} {'Dominant'}")
+    print("-" * 120)
+    for _, row in gene_stats.head(20).iterrows():
+        total_str = f"{row['mean_total']:.8f} ± {row['std_total']:.8f}"
+        mut_str   = f"{row['mean_mut']:.6f} ± {row['std_mut']:.6f}"
+        cnv_str   = f"{row['mean_cnv']:.6f} ± {row['std_cnv']:.6f}"
+        print(f"{int(row['overall_rank']):<6} {row['gene_name']:<20} {total_str:<22} "
+              f"{mut_str:<20} {cnv_str:<20} "
+              f"{row['mean_mut_pct']:<8.1f} {row['mean_cnv_pct']:<8.1f} {row['omic_dominant']}")
+
+    # Save CSV
+    aggregate_csv = os.path.join(gene_dir, "aggregate_gene_importance.csv")
+    gene_stats.to_csv(aggregate_csv, index=False)
+    print(f"\nAggregate gene importance saved to: {aggregate_csv}")
+
+    # Save top-20 JSON
+    top_genes = []
+    for _, row in gene_stats.head(20).iterrows():
+        top_genes.append({
+            'overall_rank': int(row['overall_rank']),
+            'gene_idx': int(row['gene_idx']),
+            'gene_name': row['gene_name'],
+            'mean_total_attribution': float(row['mean_total']),
+            'std_total_attribution': float(row['std_total']),
+            'mean_mut_attribution': float(row['mean_mut']),
+            'mean_cnv_attribution': float(row['mean_cnv']),
+            'mean_mut_pct': float(row['mean_mut_pct']),
+            'mean_cnv_pct': float(row['mean_cnv_pct']),
+            'omic_dominant': row['omic_dominant']
+        })
+
+    aggregate_json = os.path.join(gene_dir, "aggregate_top_genes.json")
+    with open(aggregate_json, 'w') as f:
+        json.dump({
+            'n_folds': n_folds,
+            'top_genes': top_genes,
+            'total_genes_analyzed': len(gene_stats),
+            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }, f, indent=2)
+    print(f"Aggregate top genes saved to: {aggregate_json}")
+
+    print(f"{'='*70}\n")
+    return gene_stats
 
 
 # finding important pathways
@@ -1072,9 +1284,8 @@ def analyze_and_save_pathway_importance(model, test_loader, pathway_names, devic
     mut_pw_scores = cnv_pw_scores = omic_dominance = None
     if pathway_gene_lists is not None:
         print("  Computing omic contributions (Gradient × Input)...")
-        mut_pw_scores, cnv_pw_scores, omic_dominance = compute_omic_contributions(
-            model, test_loader, pathway_gene_lists, device
-        )
+        mut_pw_scores, cnv_pw_scores, omic_dominance, mut_gene_scores, cnv_gene_scores = \
+            compute_omic_contributions(model, test_loader, pathway_gene_lists, device)
         print("  Omic contribution computed.")
     # ────────────────────────────────────────────────────────────────────────
 
@@ -1163,12 +1374,16 @@ def analyze_and_save_pathway_importance(model, test_loader, pathway_names, devic
         }, f, indent=2)
     print(f"Top {top_k} pathways saved to: {json_file}")
 
-    return {
+    result = {
         'fold': fold_num,
         'top_pathways': pathway_results,
         'all_rankings': all_rankings,
         'mean_scores': mean_pathway_weights
     }
+    if has_omic:
+        result['mut_gene_scores'] = mut_gene_scores
+        result['cnv_gene_scores'] = cnv_gene_scores
+    return result
 # ===============================
 # MAIN FUNCTION - 5-FOLD CV
 # ===============================
@@ -1405,8 +1620,18 @@ def main_5fold_cv():
             pathway_gene_lists=pathway_gene_lists,   # enables omic contribution
             top_k=10  # Change this to get more/fewer top pathways
         )
+        # Gene-level omic contribution analysis (top genes for metastatic progression)
+        if 'mut_gene_scores' in pathway_analysis:
+            analyze_and_save_gene_importance(
+                mut_gene_scores=pathway_analysis['mut_gene_scores'],
+                cnv_gene_scores=pathway_analysis['cnv_gene_scores'],
+                gene_cols=gene_cols,
+                outdir=args.outdir,
+                fold_num=fold,
+                top_k=20
+            )
         # ===== END OF ADDITION =====
-        
+
         # Store test predictions
         all_test_y_true.append(test_metrics['y_true'])
         all_test_y_pred.append(test_metrics['y_pred'])
@@ -1512,6 +1737,17 @@ def main_5fold_cv():
     except Exception as e:
         print(f"Warning: Could not aggregate pathway importance: {str(e)}")
         aggregate_pathway_summary = None
+
+    # Aggregate gene importance across all folds
+    try:
+        print(f"\nAggregating gene importance across folds...")
+        aggregate_gene_summary = aggregate_gene_rankings_across_folds(
+            outdir=args.outdir,
+            n_folds=5
+        )
+    except Exception as e:
+        print(f"Warning: Could not aggregate gene importance: {str(e)}")
+        aggregate_gene_summary = None
     # ===== END OF ADDITION =====
 
     # Save results
