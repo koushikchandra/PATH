@@ -1620,6 +1620,83 @@ def analyze_and_save_pathway_importance(model, test_loader, pathway_names, devic
         result['cnv_gene_scores'] = cnv_gene_scores
     return result
 # ===============================
+# Checkpoint / Resume Helpers
+# ===============================
+
+def save_progress_checkpoint(outdir, completed_folds,
+                              all_fold_val_metrics, all_fold_test_metrics,
+                              all_fold_details, all_fold_predictions,
+                              all_test_y_true, all_test_y_pred, all_test_y_probs):
+    """
+    Save training progress so a interrupted run can resume from the last
+    completed fold.
+
+    Per-fold prediction DataFrames are saved as individual CSVs because
+    pandas DataFrames are not JSON-serialisable.  Everything else goes into
+    a single JSON file.
+
+    Files written:
+        {outdir}/checkpoint_progress.json
+        {outdir}/checkpoint_fold{N}_predictions.csv  (one per completed fold)
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # Save per-fold prediction DataFrames as CSV
+    for fold_num, df in zip(completed_folds, all_fold_predictions):
+        pred_path = os.path.join(outdir, f"checkpoint_fold{fold_num}_predictions.csv")
+        df.to_csv(pred_path, index=False)
+
+    checkpoint = {
+        'completed_folds': completed_folds,
+        'all_fold_val_metrics': all_fold_val_metrics,
+        'all_fold_test_metrics': all_fold_test_metrics,
+        'all_fold_details': all_fold_details,
+        'all_test_y_true':  [arr.tolist() for arr in all_test_y_true],
+        'all_test_y_pred':  [arr.tolist() for arr in all_test_y_pred],
+        'all_test_y_probs': [arr.tolist() for arr in all_test_y_probs],
+    }
+
+    checkpoint_path = os.path.join(outdir, 'checkpoint_progress.json')
+    with open(checkpoint_path, 'w') as f:
+        json.dump(checkpoint, f)
+
+    print(f"  [Checkpoint] Fold {completed_folds[-1]} saved → {checkpoint_path}")
+
+
+def load_progress_checkpoint(outdir):
+    """
+    Load a previously saved checkpoint.
+
+    Returns a dict with restored state (numpy arrays and DataFrames
+    reconstructed), or None if no checkpoint exists.
+    """
+    checkpoint_path = os.path.join(outdir, 'checkpoint_progress.json')
+    if not os.path.exists(checkpoint_path):
+        return None
+
+    with open(checkpoint_path, 'r') as f:
+        checkpoint = json.load(f)
+
+    # Restore numpy arrays
+    checkpoint['all_test_y_true']  = [np.array(a) for a in checkpoint['all_test_y_true']]
+    checkpoint['all_test_y_pred']  = [np.array(a) for a in checkpoint['all_test_y_pred']]
+    checkpoint['all_test_y_probs'] = [np.array(a) for a in checkpoint['all_test_y_probs']]
+
+    # Restore per-fold prediction DataFrames
+    all_fold_predictions = []
+    for fold_num in checkpoint['completed_folds']:
+        pred_path = os.path.join(outdir, f"checkpoint_fold{fold_num}_predictions.csv")
+        if os.path.exists(pred_path):
+            all_fold_predictions.append(pd.read_csv(pred_path))
+        else:
+            print(f"  [Checkpoint Warning] Missing prediction file for fold {fold_num}, skipping.")
+            all_fold_predictions.append(pd.DataFrame())
+    checkpoint['all_fold_predictions'] = all_fold_predictions
+
+    return checkpoint
+
+
+# ===============================
 # MAIN FUNCTION - 5-FOLD CV
 # ===============================
 
@@ -1705,12 +1782,30 @@ def main_5fold_cv():
     all_fold_test_metrics = []
     all_fold_details = []
     all_fold_predictions = []
-    
+
     # Storage for aggregate visualizations
     all_test_y_true = []
     all_test_y_pred = []
     all_test_y_probs = []
-    
+
+    # ── Checkpoint / Resume ──────────────────────────────────────────────────
+    completed_folds = []
+    checkpoint = load_progress_checkpoint(args.outdir)
+    if checkpoint:
+        completed_folds       = checkpoint['completed_folds']
+        all_fold_val_metrics  = checkpoint['all_fold_val_metrics']
+        all_fold_test_metrics = checkpoint['all_fold_test_metrics']
+        all_fold_details      = checkpoint['all_fold_details']
+        all_fold_predictions  = checkpoint['all_fold_predictions']
+        all_test_y_true       = checkpoint['all_test_y_true']
+        all_test_y_pred       = checkpoint['all_test_y_pred']
+        all_test_y_probs      = checkpoint['all_test_y_probs']
+        print(f"\n[RESUME] Checkpoint found — folds already done: {completed_folds}")
+        print(f"[RESUME] Resuming from fold {max(completed_folds) + 1}")
+    else:
+        print(f"\n[RESUME] No checkpoint found — starting from fold 1")
+    # ─────────────────────────────────────────────────────────────────────────
+
     print(f"\nStarting 5-fold CV evaluation...")
     
     # MAIN FOLD LOOP
@@ -1721,7 +1816,13 @@ def main_5fold_cv():
         test_idx = np.array(fold_data['test_idx'])
         
         print(f"\n{'='*50} FOLD {fold}/5 {'='*50}")
-        
+
+        # ── Resume: skip this fold if already done ───────────────────────────
+        if fold in completed_folds:
+            print(f"  [Checkpoint] Fold {fold} already completed — skipping.")
+            continue
+        # ─────────────────────────────────────────────────────────────────────
+
         # Set seed
         set_seed(args.random_state + fold)
         
@@ -1911,6 +2012,27 @@ def main_5fold_cv():
             'val_metrics': val_metrics_clean,
             'test_metrics': test_metrics_clean
         })
+
+        # ── Save checkpoint so we can resume if interrupted ──────────────────
+        completed_folds.append(fold)
+        save_progress_checkpoint(
+            args.outdir, completed_folds,
+            all_fold_val_metrics, all_fold_test_metrics, all_fold_details,
+            all_fold_predictions, all_test_y_true, all_test_y_pred, all_test_y_probs
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
+# ── All folds complete: remove checkpoint ───────────────────────────────────
+    checkpoint_path = os.path.join(args.outdir, 'checkpoint_progress.json')
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        # Remove per-fold prediction temp files
+        for fn in completed_folds:
+            pred_path = os.path.join(args.outdir, f"checkpoint_fold{fn}_predictions.csv")
+            if os.path.exists(pred_path):
+                os.remove(pred_path)
+        print("[Checkpoint] All folds complete — checkpoint files removed.")
+    # ─────────────────────────────────────────────────────────────────────────
 
 # FINAL RESULTS
     print(f"\n{'='*70}")
