@@ -1132,6 +1132,241 @@ def analyze_and_save_gene_importance(mut_gene_scores, cnv_gene_scores, gene_cols
     return {'fold': fold_num, 'top_genes': top_gene_results, 'all_gene_rankings': all_gene_rankings}
 
 
+def analyze_top_genes_per_pathway(top_pathways, mut_gene_scores, cnv_gene_scores,
+                                   pathway_gene_lists, gene_cols, outdir, fold_num,
+                                   top_k_genes=10):
+    """
+    For each of the top pathways, rank the genes inside that pathway by
+    Gradient×Input attribution and show how much each gene's signal comes
+    from mutation vs CNV.
+
+    Args:
+        top_pathways:      List of dicts from analyze_and_save_pathway_importance()
+                           (each has 'rank', 'pathway_idx', 'pathway_name', 'importance_score')
+        mut_gene_scores:   np.ndarray [num_genes] – per-gene mutation attribution
+        cnv_gene_scores:   np.ndarray [num_genes] – per-gene CNV attribution
+        pathway_gene_lists: List of gene-index lists per pathway
+        gene_cols:         List of gene names
+        outdir:            Root output directory
+        fold_num:          Current fold number
+        top_k_genes:       How many top genes to show per pathway (default 10)
+
+    Returns:
+        List of flat row dicts (pathway_idx, gene_name, omic scores, …)
+    """
+    pg_dir = os.path.join(outdir, "pathway_gene_importance")
+    os.makedirs(pg_dir, exist_ok=True)
+
+    print(f"\n{'='*70}")
+    print(f"TOP GENES PER PATHWAY - FOLD {fold_num}")
+    print(f"{'='*70}")
+
+    all_rows = []
+    pathway_json_list = []
+
+    for pw_entry in top_pathways:
+        pw_rank  = pw_entry['rank']
+        pw_idx   = pw_entry['pathway_idx']
+        pw_name  = pw_entry['pathway_name']
+        pw_score = pw_entry['importance_score']
+
+        gene_idxs = pathway_gene_lists[pw_idx]
+        if len(gene_idxs) == 0:
+            continue
+
+        # Score and rank genes within this pathway only
+        pw_total = np.array([float(mut_gene_scores[g] + cnv_gene_scores[g]) for g in gene_idxs])
+        local_ranking = np.argsort(-pw_total)        # indices into gene_idxs
+
+        show_k = min(top_k_genes, len(gene_idxs))
+        print(f"\n  Pathway #{pw_rank}: {pw_name}  (importance={pw_score:.6f}, {len(gene_idxs)} genes)")
+        print(f"  {'Rank':<5} {'Gene':<20} {'Total Attr':<16} {'Mut Attr':<16} {'CNV Attr':<16} "
+              f"{'Mut%':<8} {'CNV%':<8} {'Dominant'}")
+        print(f"  {'-'*95}")
+
+        pw_gene_entries = []
+        for gene_rank, pos in enumerate(local_ranking[:show_k], 1):
+            g_idx     = gene_idxs[pos]
+            gene_name = gene_cols[g_idx] if g_idx < len(gene_cols) else f"Gene_{g_idx}"
+            total = float(mut_gene_scores[g_idx] + cnv_gene_scores[g_idx])
+            m_s   = float(mut_gene_scores[g_idx])
+            c_s   = float(cnv_gene_scores[g_idx])
+            dom   = m_s / (total + 1e-12)
+            dominant = "MUT" if dom >= 0.5 else "CNV"
+            mut_pct  = dom * 100
+            cnv_pct  = (1 - dom) * 100
+
+            print(f"  {gene_rank:<5} {gene_name:<20} {total:<16.8f} {m_s:<16.8f} {c_s:<16.8f} "
+                  f"{mut_pct:<8.1f} {cnv_pct:<8.1f} {dominant}")
+
+            row = {
+                'fold': fold_num,
+                'pathway_rank': pw_rank,
+                'pathway_idx': pw_idx,
+                'pathway_name': pw_name,
+                'pathway_importance': pw_score,
+                'gene_rank_in_pathway': gene_rank,
+                'gene_idx': int(g_idx),
+                'gene_name': gene_name,
+                'total_attribution': total,
+                'mut_attribution': m_s,
+                'cnv_attribution': c_s,
+                'mut_pct': round(mut_pct, 2),
+                'cnv_pct': round(cnv_pct, 2),
+                'omic_dominant': dominant
+            }
+            all_rows.append(row)
+            pw_gene_entries.append({
+                'gene_rank': gene_rank,
+                'gene_name': gene_name,
+                'total_attribution': total,
+                'mut_attribution': m_s,
+                'cnv_attribution': c_s,
+                'mut_pct': round(mut_pct, 2),
+                'cnv_pct': round(cnv_pct, 2),
+                'omic_dominant': dominant
+            })
+
+        pathway_json_list.append({
+            'pathway_rank': pw_rank,
+            'pathway_idx': pw_idx,
+            'pathway_name': pw_name,
+            'pathway_importance': pw_score,
+            'top_genes': pw_gene_entries
+        })
+
+    # Save flat CSV
+    csv_file = os.path.join(pg_dir, f"pathway_gene_importance_fold{fold_num}.csv")
+    pd.DataFrame(all_rows).to_csv(csv_file, index=False)
+    print(f"\nPathway-gene importance saved to: {csv_file}")
+
+    # Save structured JSON
+    json_file = os.path.join(pg_dir, f"pathway_top_genes_fold{fold_num}.json")
+    with open(json_file, 'w') as f:
+        json.dump({
+            'fold': fold_num,
+            'pathways': pathway_json_list,
+            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }, f, indent=2)
+    print(f"Pathway-gene JSON saved to: {json_file}")
+
+    return all_rows
+
+
+def aggregate_pathway_gene_rankings_across_folds(outdir, n_folds=5):
+    """
+    Aggregate per-pathway gene importance across all CV folds.
+
+    For each (pathway, gene) pair seen in the top pathways, computes
+    mean/std of attribution scores and reports the consistent top genes
+    per pathway across folds.
+
+    Args:
+        outdir:   Root output directory
+        n_folds:  Number of CV folds
+
+    Returns:
+        DataFrame with aggregate pathway-gene statistics, or None if no data found
+    """
+    pg_dir = os.path.join(outdir, "pathway_gene_importance")
+    if not os.path.exists(pg_dir):
+        print(f"Warning: Pathway-gene importance directory not found: {pg_dir}")
+        return None
+
+    print(f"\n{'='*70}")
+    print("AGGREGATING PATHWAY-GENE IMPORTANCE ACROSS ALL FOLDS")
+    print(f"{'='*70}")
+
+    all_fold_data = []
+    for fold in range(1, n_folds + 1):
+        csv_file = os.path.join(pg_dir, f"pathway_gene_importance_fold{fold}.csv")
+        if os.path.exists(csv_file):
+            all_fold_data.append(pd.read_csv(csv_file))
+            print(f"Loaded fold {fold} pathway-gene data")
+        else:
+            print(f"Warning: Missing fold {fold}: {csv_file}")
+
+    if not all_fold_data:
+        print("Error: No pathway-gene fold data found!")
+        return None
+
+    combined = pd.concat(all_fold_data, ignore_index=True)
+
+    stats = combined.groupby(['pathway_idx', 'gene_idx']).agg(
+        pathway_name=('pathway_name', 'first'),
+        gene_name=('gene_name', 'first'),
+        mean_pathway_rank=('pathway_rank', 'mean'),
+        mean_total=('total_attribution', 'mean'),
+        std_total=('total_attribution', 'std'),
+        mean_mut=('mut_attribution', 'mean'),
+        std_mut=('mut_attribution', 'std'),
+        mean_cnv=('cnv_attribution', 'mean'),
+        std_cnv=('cnv_attribution', 'std'),
+        mean_gene_rank=('gene_rank_in_pathway', 'mean'),
+        std_gene_rank=('gene_rank_in_pathway', 'std')
+    ).reset_index()
+
+    total = stats['mean_mut'] + stats['mean_cnv'] + 1e-12
+    stats['mean_mut_pct'] = (stats['mean_mut'] / total * 100).round(2)
+    stats['mean_cnv_pct'] = (stats['mean_cnv'] / total * 100).round(2)
+    stats['omic_dominant'] = stats['mean_mut_pct'].apply(lambda x: 'MUT' if x >= 50.0 else 'CNV')
+
+    # Print top genes per pathway (sorted by mean_total within each pathway)
+    pathway_groups = stats.sort_values('mean_pathway_rank')
+    for pw_idx, pw_df in pathway_groups.groupby('pathway_idx', sort=False):
+        pw_name = pw_df['pathway_name'].iloc[0]
+        pw_rank = pw_df['mean_pathway_rank'].iloc[0]
+        top_genes = pw_df.sort_values('mean_total', ascending=False).head(10)
+
+        print(f"\n  Pathway #{int(pw_rank)}: {pw_name}")
+        print(f"  {'Gene':<20} {'Mean Total Attr':<28} {'Mut%':<8} {'CNV%':<8} {'Dominant'}")
+        print(f"  {'-'*72}")
+        for _, row in top_genes.iterrows():
+            total_str = f"{row['mean_total']:.8f} ± {row['std_total']:.8f}"
+            print(f"  {row['gene_name']:<20} {total_str:<28} "
+                  f"{row['mean_mut_pct']:<8.1f} {row['mean_cnv_pct']:<8.1f} {row['omic_dominant']}")
+
+    # Save aggregate CSV
+    agg_csv = os.path.join(pg_dir, "aggregate_pathway_gene_importance.csv")
+    stats.sort_values(['mean_pathway_rank', 'mean_total'], ascending=[True, False]).to_csv(agg_csv, index=False)
+    print(f"\nAggregate pathway-gene importance saved to: {agg_csv}")
+
+    # Save structured JSON
+    agg_json_data = []
+    for pw_idx, pw_df in pathway_groups.groupby('pathway_idx', sort=False):
+        top_genes = pw_df.sort_values('mean_total', ascending=False).head(10)
+        agg_json_data.append({
+            'pathway_idx': int(pw_idx),
+            'pathway_name': pw_df['pathway_name'].iloc[0],
+            'mean_pathway_rank': float(pw_df['mean_pathway_rank'].iloc[0]),
+            'top_genes': [
+                {
+                    'gene_name': row['gene_name'],
+                    'mean_total_attribution': float(row['mean_total']),
+                    'std_total_attribution': float(row['std_total']),
+                    'mean_mut_attribution': float(row['mean_mut']),
+                    'mean_cnv_attribution': float(row['mean_cnv']),
+                    'mean_mut_pct': float(row['mean_mut_pct']),
+                    'mean_cnv_pct': float(row['mean_cnv_pct']),
+                    'omic_dominant': row['omic_dominant']
+                }
+                for _, row in top_genes.iterrows()
+            ]
+        })
+
+    agg_json = os.path.join(pg_dir, "aggregate_pathway_top_genes.json")
+    with open(agg_json, 'w') as f:
+        json.dump({
+            'n_folds': n_folds,
+            'pathways': agg_json_data,
+            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }, f, indent=2)
+    print(f"Aggregate pathway-gene JSON saved to: {agg_json}")
+
+    print(f"{'='*70}\n")
+    return stats
+
+
 def aggregate_gene_rankings_across_folds(outdir, n_folds=5):
     """
     Aggregate gene importance rankings across all CV folds.
@@ -1630,6 +1865,17 @@ def main_5fold_cv():
                 fold_num=fold,
                 top_k=20
             )
+            # Top genes within each of the top 10 pathways
+            analyze_top_genes_per_pathway(
+                top_pathways=pathway_analysis['top_pathways'],
+                mut_gene_scores=pathway_analysis['mut_gene_scores'],
+                cnv_gene_scores=pathway_analysis['cnv_gene_scores'],
+                pathway_gene_lists=pathway_gene_lists,
+                gene_cols=gene_cols,
+                outdir=args.outdir,
+                fold_num=fold,
+                top_k_genes=10
+            )
         # ===== END OF ADDITION =====
 
         # Store test predictions
@@ -1748,6 +1994,17 @@ def main_5fold_cv():
     except Exception as e:
         print(f"Warning: Could not aggregate gene importance: {str(e)}")
         aggregate_gene_summary = None
+
+    # Aggregate top-genes-per-pathway across all folds
+    try:
+        print(f"\nAggregating pathway-gene importance across folds...")
+        aggregate_pathway_gene_summary = aggregate_pathway_gene_rankings_across_folds(
+            outdir=args.outdir,
+            n_folds=5
+        )
+    except Exception as e:
+        print(f"Warning: Could not aggregate pathway-gene importance: {str(e)}")
+        aggregate_pathway_gene_summary = None
     # ===== END OF ADDITION =====
 
     # Save results
