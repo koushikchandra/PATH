@@ -733,7 +733,7 @@ class PathwayGraphTransformer(nn.Module):
             if self.use_edge_mask:
                 nonedge = (A <= 0)
                 # CHANGED: Use soft penalty instead of -inf
-                # mask = mask.masked_fill(nonedge, -10.0)  # ← ONLY THIS LINE CHANGED!
+                mask = mask.masked_fill(nonedge, -10.0)  # ← ONLY THIS LINE CHANGED!
                 # mask = mask.masked_fill(nonedge, float('-inf'))  # HARD mask
                 mask.fill_diagonal_(0.0)
 
