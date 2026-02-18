@@ -65,18 +65,40 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
     combined_df = pd.concat(all_fold_data, ignore_index=True)
     
     # Calculate aggregate statistics for each pathway
-    pathway_stats = combined_df.groupby('pathway_idx').agg({
+    has_omic = 'mut_attribution' in combined_df.columns and 'cnv_attribution' in combined_df.columns
+
+    agg_dict = {
         'pathway_name': 'first',
         'importance_score': ['mean', 'std', 'min', 'max'],
         'rank': ['mean', 'std', 'min', 'max']
-    }).reset_index()
-    
+    }
+    if has_omic:
+        agg_dict['mut_attribution'] = ['mean', 'std']
+        agg_dict['cnv_attribution'] = ['mean', 'std']
+
+    pathway_stats = combined_df.groupby('pathway_idx').agg(agg_dict).reset_index()
+
     # Flatten column names
-    pathway_stats.columns = [
+    base_cols = [
         'pathway_idx', 'pathway_name',
         'mean_importance', 'std_importance', 'min_importance', 'max_importance',
         'mean_rank', 'std_rank', 'min_rank', 'max_rank'
     ]
+    if has_omic:
+        base_cols += [
+            'mean_mut_attribution', 'std_mut_attribution',
+            'mean_cnv_attribution', 'std_cnv_attribution'
+        ]
+    pathway_stats.columns = base_cols
+
+    # Derive aggregated omic dominance
+    if has_omic:
+        total = pathway_stats['mean_mut_attribution'] + pathway_stats['mean_cnv_attribution'] + 1e-12
+        pathway_stats['mean_mut_pct'] = (pathway_stats['mean_mut_attribution'] / total * 100).round(2)
+        pathway_stats['mean_cnv_pct'] = (pathway_stats['mean_cnv_attribution'] / total * 100).round(2)
+        pathway_stats['omic_dominant'] = pathway_stats['mean_mut_pct'].apply(
+            lambda x: 'MUT' if x >= 50.0 else 'CNV'
+        )
     
     # Sort by mean importance (descending)
     pathway_stats = pathway_stats.sort_values('mean_importance', ascending=False).reset_index(drop=True)
@@ -84,26 +106,36 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
     
     # Display top 20 pathways
     print(f"\nTop 20 Most Consistently Important Pathways (Across {n_folds} Folds):")
-    print("-" * 100)
-    print(f"{'Rank':<6} {'Pathway':<15} {'Name':<35} {'Mean Importance':<18} {'Mean Rank':<12}")
-    print("-" * 100)
-    
+    if has_omic:
+        print("-" * 125)
+        print(f"{'Rank':<6} {'Pathway':<12} {'Name':<32} {'Mean Importance':<26} {'Mean Rank':<18} {'Mut%':<8} {'CNV%':<8} {'Dominant'}")
+        print("-" * 125)
+    else:
+        print("-" * 100)
+        print(f"{'Rank':<6} {'Pathway':<15} {'Name':<35} {'Mean Importance':<18} {'Mean Rank':<12}")
+        print("-" * 100)
+
     for _, row in pathway_stats.head(20).iterrows():
-        display_name = row['pathway_name'][:33] + "..." if len(row['pathway_name']) > 35 else row['pathway_name']
+        display_name = row['pathway_name'][:30] + "..." if len(row['pathway_name']) > 32 else row['pathway_name']
         importance_str = f"{row['mean_importance']:.6f} ± {row['std_importance']:.6f}"
         rank_str = f"{row['mean_rank']:.1f} ± {row['std_rank']:.1f}"
-        print(f"{int(row['overall_rank']):<6} {int(row['pathway_idx']):<15} {display_name:<35} "
-              f"{importance_str:<18} {rank_str:<12}")
-    
-    # Save aggregate results
+        if has_omic:
+            print(f"{int(row['overall_rank']):<6} {int(row['pathway_idx']):<12} {display_name:<32} "
+                  f"{importance_str:<26} {rank_str:<18} "
+                  f"{row['mean_mut_pct']:<8.1f} {row['mean_cnv_pct']:<8.1f} {row['omic_dominant']}")
+        else:
+            print(f"{int(row['overall_rank']):<6} {int(row['pathway_idx']):<15} {display_name:<35} "
+                  f"{importance_str:<18} {rank_str:<12}")
+
+    # Save aggregate results (CSV includes all columns automatically)
     aggregate_csv = os.path.join(pathway_dir, "aggregate_pathway_importance.csv")
     pathway_stats.to_csv(aggregate_csv, index=False)
     print(f"\nAggregate pathway importance saved to: {aggregate_csv}")
-    
+
     # Save top pathways to JSON
     top_pathways = []
     for _, row in pathway_stats.head(20).iterrows():
-        top_pathways.append({
+        entry = {
             'overall_rank': int(row['overall_rank']),
             'pathway_idx': int(row['pathway_idx']),
             'pathway_name': row['pathway_name'],
@@ -111,7 +143,16 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
             'std_importance': float(row['std_importance']),
             'mean_rank': float(row['mean_rank']),
             'std_rank': float(row['std_rank'])
-        })
+        }
+        if has_omic:
+            entry.update({
+                'mean_mut_attribution': float(row['mean_mut_attribution']),
+                'mean_cnv_attribution': float(row['mean_cnv_attribution']),
+                'mean_mut_pct': float(row['mean_mut_pct']),
+                'mean_cnv_pct': float(row['mean_cnv_pct']),
+                'omic_dominant': row['omic_dominant']
+            })
+        top_pathways.append(entry)
     
     aggregate_json = os.path.join(pathway_dir, "aggregate_top_pathways.json")
     with open(aggregate_json, 'w') as f:
@@ -732,9 +773,7 @@ class PathwayGraphTransformer(nn.Module):
         else:
             if self.use_edge_mask:
                 nonedge = (A <= 0)
-                # CHANGED: Use soft penalty instead of -inf
-                # mask = mask.masked_fill(nonedge, -10.0)  # ← ONLY THIS LINE CHANGED!
-                # mask = mask.masked_fill(nonedge, float('-inf'))  # HARD mask
+                mask = mask.masked_fill(nonedge, -10.0)  # soft penalty for non-edges
                 mask.fill_diagonal_(0.0)
 
         self.attn_mask = mask.detach()
@@ -926,84 +965,195 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
         
-# finding important pathways
-def analyze_and_save_pathway_importance(model, test_loader, pathway_names, device, outdir, fold_num, top_k=10):
+# ===============================
+# Omic Contribution Analysis
+# ===============================
+
+def compute_omic_contributions(model, loader, pathway_gene_lists, device):
     """
-    Analyze pathway importance and save top influential pathways
-    
+    Compute per-omic (mutation vs CNV) contribution to each pathway
+    using Gradient × Input attribution.
+
+    For each sample:
+      attr_mut[g] = |grad_logit1 w.r.t. mut[g]| × |mut[g]|
+      attr_cnv[g] = |grad_logit1 w.r.t. cnv[g]| × |cnv[g]|
+
+    Then aggregate gene-level scores to pathway level by averaging
+    across all genes in the pathway.
+
+    Args:
+        model: Trained PathwayGraphTransformer
+        loader: DataLoader (test or val)
+        pathway_gene_lists: List of gene index lists per pathway
+        device: torch device
+
+    Returns:
+        mut_pathway_scores: np.ndarray [num_pathways] – mutation attribution per pathway
+        cnv_pathway_scores: np.ndarray [num_pathways] – CNV attribution per pathway
+        omic_dominance:     np.ndarray [num_pathways] – ratio mut/(mut+cnv+eps)
+    """
+    model.eval()
+    mut_attrs_all = []
+    cnv_attrs_all = []
+
+    for mut_b, cnv_b, _ in loader:
+        mut_b = mut_b.to(device).float().requires_grad_(True)
+        cnv_b = cnv_b.to(device).float().requires_grad_(True)
+
+        logits = model(mut_b, cnv_b)
+        # Attribute toward the metastatic class (index 1)
+        score = logits[:, 1].sum()
+        score.backward()
+
+        # Gradient × Input (absolute value for magnitude)
+        mut_attr = (mut_b.grad * mut_b).abs().detach().cpu().numpy()   # [B, G]
+        cnv_attr = (cnv_b.grad * cnv_b).abs().detach().cpu().numpy()   # [B, G]
+
+        mut_attrs_all.append(mut_attr)
+        cnv_attrs_all.append(cnv_attr)
+
+    # Average across all samples → [G]
+    mut_gene = np.mean(np.vstack(mut_attrs_all), axis=0)
+    cnv_gene = np.mean(np.vstack(cnv_attrs_all), axis=0)
+
+    # Aggregate gene → pathway by mean over member genes
+    mut_pathway = np.zeros(len(pathway_gene_lists), dtype=np.float32)
+    cnv_pathway = np.zeros(len(pathway_gene_lists), dtype=np.float32)
+    for p, gene_idxs in enumerate(pathway_gene_lists):
+        if len(gene_idxs) > 0:
+            mut_pathway[p] = float(mut_gene[gene_idxs].mean())
+            cnv_pathway[p] = float(cnv_gene[gene_idxs].mean())
+
+    # Dominance: fraction of total attribution from mutation
+    total = mut_pathway + cnv_pathway + 1e-12
+    omic_dominance = mut_pathway / total   # >0.5 → mut-dominant, <0.5 → cnv-dominant
+
+    return mut_pathway, cnv_pathway, omic_dominance
+
+
+# finding important pathways
+def analyze_and_save_pathway_importance(model, test_loader, pathway_names, device, outdir, fold_num,
+                                        pathway_gene_lists=None, top_k=10):
+    """
+    Analyze pathway importance and save top influential pathways.
+    When pathway_gene_lists is provided, also computes per-omic (mutation vs CNV)
+    contribution to each pathway via Gradient×Input attribution.
+
     Args:
         model: Trained model
-        val_loader: Validation data loader
+        test_loader: Test data loader
         pathway_names: List of pathway names
         device: torch device
         outdir: Output directory
         fold_num: Current fold number
+        pathway_gene_lists: List of gene-index lists per pathway (required for omic contribution)
         top_k: Number of top pathways to display and save
-    
+
     Returns:
-        Dictionary with pathway rankings and scores
+        Dictionary with pathway rankings and scores (including omic contributions if available)
     """
     model.eval()
     all_pathway_weights = []
-    
+
     print(f"\n{'='*70}")
     print(f"PATHWAY IMPORTANCE ANALYSIS - FOLD {fold_num}")
     print(f"{'='*70}")
-    
+
     with torch.no_grad():
         for mut_b, cnv_b, _ in test_loader:
             mut_b, cnv_b = mut_b.to(device), cnv_b.to(device)
             _, extras = model(mut_b, cnv_b, return_extras=True)
             all_pathway_weights.append(extras["pathway_weights"].cpu().numpy())
-    
-    # Calculate mean importance across all validation samples
+
+    # Calculate mean importance across all test samples
     mean_pathway_weights = np.mean(np.vstack(all_pathway_weights), axis=0)
-    
+
+    # ── Omic contribution via Gradient × Input ──────────────────────────────
+    mut_pw_scores = cnv_pw_scores = omic_dominance = None
+    if pathway_gene_lists is not None:
+        print("  Computing omic contributions (Gradient × Input)...")
+        mut_pw_scores, cnv_pw_scores, omic_dominance = compute_omic_contributions(
+            model, test_loader, pathway_gene_lists, device
+        )
+        print("  Omic contribution computed.")
+    # ────────────────────────────────────────────────────────────────────────
+
     # Rank pathways by importance (descending)
     pathway_ranking = np.argsort(-mean_pathway_weights)
-    
+
     # Display top pathways
-    print(f"\nTop {top_k} Most Influential Pathways:")
-    print("-" * 80)
-    print(f"{'Rank':<6} {'Pathway ID':<15} {'Pathway Name':<40} {'Score':<12}")
-    print("-" * 80)
-    
+    has_omic = mut_pw_scores is not None
+    if has_omic:
+        print(f"\nTop {top_k} Most Influential Pathways (with Omic Contribution):")
+        print("-" * 110)
+        print(f"{'Rank':<6} {'Pathway ID':<12} {'Pathway Name':<38} {'Score':<12} {'Mut%':<10} {'CNV%':<10} {'Dominant':<10}")
+        print("-" * 110)
+    else:
+        print(f"\nTop {top_k} Most Influential Pathways:")
+        print("-" * 80)
+        print(f"{'Rank':<6} {'Pathway ID':<15} {'Pathway Name':<40} {'Score':<12}")
+        print("-" * 80)
+
     pathway_results = []
     for rank, idx in enumerate(pathway_ranking[:top_k], 1):
         pathway_name = pathway_names[idx] if idx < len(pathway_names) else f"Pathway_{idx}"
         score = mean_pathway_weights[idx]
-        
-        # Truncate long names for display
-        display_name = pathway_name[:38] + "..." if len(pathway_name) > 40 else pathway_name
-        
-        print(f"{rank:<6} {idx:<15} {display_name:<40} {score:.8f}")
-        
-        pathway_results.append({
+        display_name = pathway_name[:36] + "..." if len(pathway_name) > 38 else pathway_name
+
+        entry = {
             'rank': rank,
             'pathway_idx': int(idx),
             'pathway_name': pathway_name,
             'importance_score': float(score)
-        })
-    
+        }
+
+        if has_omic:
+            m_s = float(mut_pw_scores[idx])
+            c_s = float(cnv_pw_scores[idx])
+            dom = float(omic_dominance[idx])
+            dominant = "MUT" if dom >= 0.5 else "CNV"
+            mut_pct = dom * 100
+            cnv_pct = (1 - dom) * 100
+            print(f"{rank:<6} {idx:<12} {display_name:<38} {score:<12.8f} {mut_pct:<10.1f} {cnv_pct:<10.1f} {dominant:<10}")
+            entry.update({
+                'mut_attribution': m_s,
+                'cnv_attribution': c_s,
+                'mut_pct': round(mut_pct, 2),
+                'cnv_pct': round(cnv_pct, 2),
+                'omic_dominant': dominant
+            })
+        else:
+            print(f"{rank:<6} {idx:<15} {display_name:<40} {score:.8f}")
+
+        pathway_results.append(entry)
+
     # Save complete rankings to CSV
     all_rankings = []
     for rank, idx in enumerate(pathway_ranking, 1):
         pathway_name = pathway_names[idx] if idx < len(pathway_names) else f"Pathway_{idx}"
-        all_rankings.append({
+        row = {
             'fold': fold_num,
             'rank': rank,
             'pathway_idx': int(idx),
             'pathway_name': pathway_name,
             'importance_score': float(mean_pathway_weights[idx])
-        })
-    
-    # Save to CSV
+        }
+        if has_omic:
+            dom = float(omic_dominance[idx])
+            row.update({
+                'mut_attribution': float(mut_pw_scores[idx]),
+                'cnv_attribution': float(cnv_pw_scores[idx]),
+                'mut_pct': round(dom * 100, 2),
+                'cnv_pct': round((1 - dom) * 100, 2),
+                'omic_dominant': "MUT" if dom >= 0.5 else "CNV"
+            })
+        all_rankings.append(row)
+
     csv_file = os.path.join(outdir, f"pathway_importance_fold{fold_num}.csv")
     df_rankings = pd.DataFrame(all_rankings)
     df_rankings.to_csv(csv_file, index=False)
     print(f"\nComplete pathway rankings saved to: {csv_file}")
-    
-    # Save top pathways to JSON
+
     json_file = os.path.join(outdir, f"top_pathways_fold{fold_num}.json")
     with open(json_file, 'w') as f:
         json.dump({
@@ -1012,7 +1162,7 @@ def analyze_and_save_pathway_importance(model, test_loader, pathway_names, devic
             'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }, f, indent=2)
     print(f"Top {top_k} pathways saved to: {json_file}")
-    
+
     return {
         'fold': fold_num,
         'top_pathways': pathway_results,
@@ -1252,6 +1402,7 @@ def main_5fold_cv():
             device=device,
             outdir=pathway_importance_dir,
             fold_num=fold,
+            pathway_gene_lists=pathway_gene_lists,   # enables omic contribution
             top_k=10  # Change this to get more/fewer top pathways
         )
         # ===== END OF ADDITION =====
