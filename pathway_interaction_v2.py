@@ -592,7 +592,8 @@ class PathwayGraphTransformer(nn.Module):
         logits = self.head(global_repr)
 
         if return_extras or return_attn or return_edge:
-            extras = {'gene_alpha': gene_alpha, 'pathway_weights': pw_weights.squeeze(-1)}
+            extras = {'gene_alpha': gene_alpha, 'pathway_weights': pw_weights.squeeze(-1),
+                      'global_repr': global_repr}
             if return_attn:
                 extras['attn_weights'] = attn_weights
             if return_edge:
@@ -715,6 +716,135 @@ def evaluate_metrics(model, loader, device):
         "y_pred": pred,
         "y_probs": p1
     }
+
+
+@torch.no_grad()
+def extract_embeddings(model, loader, device):
+    """Extract global patient-level embeddings (pre-classifier head) from a data loader.
+
+    Returns pooled test-set representations, one vector per patient, suitable
+    for downstream UMAP / t-SNE visualisation and silhouette scoring.
+    """
+    model.eval()
+    all_embs, all_labels = [], []
+    for mut_b, cnv_b, y_b in loader:
+        mut_b, cnv_b = mut_b.to(device), cnv_b.to(device)
+        _, extras = model(mut_b, cnv_b, return_extras=True)
+        all_embs.append(extras['global_repr'].cpu().numpy())
+        all_labels.append(y_b.numpy())
+    return np.concatenate(all_embs, axis=0), np.concatenate(all_labels, axis=0)
+
+
+def plot_umap_tsne_embeddings(embeddings, labels, save_dir, prefix="test_embeddings",
+                               n_neighbors=15, min_dist=0.1, perplexity=30,
+                               random_state=42, dpi=300):
+    """Generate UMAP and t-SNE plots for pooled test embeddings.
+
+    Only test-set embeddings are visualised: these are honest, held-out
+    representations that reflect genuine generalisation rather than
+    training memorisation.  Comparing these across baselines is a fair,
+    apples-to-apples evaluation.
+
+    Also computes a silhouette score on the raw (pre-projection) embeddings
+    as a quantitative complement to the visual inspection.
+
+    Returns:
+        float: silhouette score on the raw embeddings.
+    """
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.manifold import TSNE
+    from sklearn.metrics import silhouette_score
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    X = StandardScaler().fit_transform(embeddings)
+
+    palette = {0: "#1f77b4", 1: "#d62728"}   # Blue = Primary, Red = Metastatic
+    label_names = {0: "Primary", 1: "Metastatic"}
+
+    # Silhouette score on raw embeddings (before dimensionality reduction)
+    sil_score = silhouette_score(embeddings, labels)
+    print(f"  Silhouette score (raw test embeddings): {sil_score:.4f}")
+
+    def _scatter(ax, coords, title, xlabel, ylabel):
+        for cls in np.unique(labels):
+            mask = labels == cls
+            ax.scatter(
+                coords[mask, 0], coords[mask, 1],
+                s=50, alpha=0.7,
+                c=palette.get(int(cls), "#555555"),
+                label=label_names.get(int(cls), f"Class {int(cls)}"),
+                edgecolors='white', linewidths=0.5
+            )
+        ax.set_xlabel(xlabel, fontsize=13, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=13, fontweight='bold')
+        ax.set_title(title, fontsize=15, fontweight='bold', pad=12)
+        ax.legend(loc="best", fontsize=11, framealpha=0.9)
+        ax.grid(alpha=0.3, linestyle='--', linewidth=0.5)
+        ax.set_axisbelow(True)
+
+    # ------------------------------------------------------------------
+    # UMAP
+    # ------------------------------------------------------------------
+    umap_coords = None
+    try:
+        import umap.umap_ as umap_module
+        n_nb = max(2, min(n_neighbors, X.shape[0] - 1))
+        reducer = umap_module.UMAP(
+            n_components=2, n_neighbors=n_nb, min_dist=min_dist,
+            metric="euclidean", random_state=random_state
+        )
+        umap_coords = reducer.fit_transform(X)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        _scatter(ax, umap_coords,
+                 f"UMAP – Pooled Test Embeddings (5-fold)\nSilhouette = {sil_score:.4f}",
+                 "UMAP-1", "UMAP-2")
+        plt.tight_layout()
+        umap_path = os.path.join(save_dir, f"{prefix}_umap.png")
+        plt.savefig(umap_path, dpi=dpi, bbox_inches='tight')
+        plt.close()
+        print(f"  UMAP saved: {umap_path}")
+    except ImportError:
+        print("  Warning: umap-learn not installed. Skipping UMAP. "
+              "Install with: pip install umap-learn")
+
+    # ------------------------------------------------------------------
+    # t-SNE
+    # ------------------------------------------------------------------
+    perp = min(perplexity, max(5, X.shape[0] // 3))
+    tsne = TSNE(
+        n_components=2, perplexity=perp, learning_rate=200,
+        n_iter=1000, random_state=random_state, init="pca", verbose=0
+    )
+    tsne_coords = tsne.fit_transform(X)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    _scatter(ax, tsne_coords,
+             f"t-SNE – Pooled Test Embeddings (5-fold)\nSilhouette = {sil_score:.4f}",
+             "t-SNE-1", "t-SNE-2")
+    plt.tight_layout()
+    tsne_path = os.path.join(save_dir, f"{prefix}_tsne.png")
+    plt.savefig(tsne_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+    print(f"  t-SNE saved: {tsne_path}")
+
+    # ------------------------------------------------------------------
+    # Combined side-by-side
+    # ------------------------------------------------------------------
+    if umap_coords is not None:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+        _scatter(ax1, umap_coords, "UMAP Projection", "UMAP-1", "UMAP-2")
+        _scatter(ax2, tsne_coords, "t-SNE Projection", "t-SNE-1", "t-SNE-2")
+        plt.suptitle(
+            f"Pooled Test Embedding Visualizations (5-fold CV)  |  Silhouette = {sil_score:.4f}",
+            fontsize=16, fontweight='bold', y=1.02
+        )
+        plt.tight_layout()
+        combined_path = os.path.join(save_dir, f"{prefix}_combined.png")
+        plt.savefig(combined_path, dpi=dpi, bbox_inches='tight')
+        plt.close()
+        print(f"  Combined plot saved: {combined_path}")
+
+    return sil_score
 
 
 # ===============================
@@ -1483,6 +1613,10 @@ def main_5fold_cv():
     all_test_y_pred = []
     all_test_y_probs = []
 
+    # Accumulators for pooled test embeddings (one entry per fold)
+    all_test_embeddings = []
+    all_test_labels_emb = []
+
     print(f"\nStarting 5-fold CV evaluation...")
 
     # MAIN FOLD LOOP
@@ -1651,6 +1785,13 @@ def main_5fold_cv():
         all_test_y_pred.append(test_metrics['y_pred'])
         all_test_y_probs.append(test_metrics['y_probs'])
 
+        # Extract test embeddings for later pooled visualization
+        # Only test-set embeddings are used: they are honest held-out
+        # representations that reflect genuine generalisation.
+        fold_embs, fold_emb_labels = extract_embeddings(model, test_loader, device)
+        all_test_embeddings.append(fold_embs)
+        all_test_labels_emb.append(fold_emb_labels)
+
         print(f"\nFold {fold} Complete!")
         print(f"   Val:  AUC={final_val_metrics['auc']:.4f}, F1={final_val_metrics['f1_binary']:.4f}")
         print(f"   Test: AUC={test_metrics['auc']:.4f}, F1={test_metrics['f1_binary']:.4f}, Acc={test_metrics['acc']:.4f}")
@@ -1755,6 +1896,28 @@ def main_5fold_cv():
         5, title=f"5-Fold CV Precision-Recall Curve - Test Set ({graph_suffix.upper()})"
     )
 
+    # Pooled test embedding visualisation (UMAP + t-SNE)
+    # Using only test-set embeddings: honest, held-out representations that
+    # reflect genuine generalisation.  Each sample appears in the test set
+    # exactly once across the 5 folds, so pooling gives full-dataset coverage
+    # with zero data leakage — making cross-baseline comparison fair.
+    embedding_silhouette = float('nan')
+    try:
+        print(f"\nGenerating pooled test embedding visualizations (UMAP + t-SNE)...")
+        emb_mat = np.concatenate(all_test_embeddings, axis=0)
+        emb_labels = np.concatenate(all_test_labels_emb, axis=0)
+        emb_viz_dir = os.path.join(viz_dir, "embeddings")
+        embedding_silhouette = plot_umap_tsne_embeddings(
+            emb_mat, emb_labels,
+            save_dir=emb_viz_dir,
+            prefix=f"test_embeddings_{graph_suffix}_{timestamp}",
+            random_state=args.random_state,
+            dpi=300
+        )
+        print(f"  Pooled test silhouette score: {embedding_silhouette:.4f}")
+    except Exception as e:
+        print(f"Warning: Could not generate embedding visualizations: {str(e)}")
+
     # Aggregate pathway importance
     try:
         print(f"\nAggregating pathway importance across folds...")
@@ -1784,6 +1947,7 @@ def main_5fold_cv():
                             'std': float(np.std([m[k] for m in all_fold_test_metrics]))}
                         for k in ['auc', 'f1_binary', 'acc', 'precision', 'recall']},
         'fold_details': all_fold_details,
+        'embedding_silhouette_score': embedding_silhouette,
         'config': vars(args)
     }
 
