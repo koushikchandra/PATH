@@ -1727,16 +1727,22 @@ def main_5fold_cv():
             os.makedirs(ablation_dir, exist_ok=True)
 
             # Prepare JSON-serializable version
-            ablation_json = {}
-            for k, v in ablation_results.items():
-                if k == 'significance':
-                    ablation_json[k] = v
-                elif isinstance(v, dict):
-                    ablation_json[k] = {kk: (vv if not isinstance(vv, (list, np.ndarray)) else
-                                            list(vv) if isinstance(vv, np.ndarray) else vv)
-                                       for kk, vv in v.items()}
-                else:
-                    ablation_json[k] = v
+            def _to_serializable(obj):
+                if isinstance(obj, dict):
+                    return {k: _to_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [_to_serializable(i) for i in obj]
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, (np.integer,)):
+                    return int(obj)
+                elif isinstance(obj, (np.floating,)):
+                    return float(obj)
+                elif isinstance(obj, (np.bool_,)):
+                    return bool(obj)
+                return obj
+
+            ablation_json = _to_serializable(ablation_results)
 
             with open(os.path.join(ablation_dir, f"ablation_fold{fold}.json"), 'w') as f:
                 json.dump(ablation_json, f, indent=2)
