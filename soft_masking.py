@@ -65,40 +65,18 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
     combined_df = pd.concat(all_fold_data, ignore_index=True)
     
     # Calculate aggregate statistics for each pathway
-    has_omic = 'mut_attribution' in combined_df.columns and 'cnv_attribution' in combined_df.columns
-
-    agg_dict = {
+    pathway_stats = combined_df.groupby('pathway_idx').agg({
         'pathway_name': 'first',
         'importance_score': ['mean', 'std', 'min', 'max'],
         'rank': ['mean', 'std', 'min', 'max']
-    }
-    if has_omic:
-        agg_dict['mut_attribution'] = ['mean', 'std']
-        agg_dict['cnv_attribution'] = ['mean', 'std']
-
-    pathway_stats = combined_df.groupby('pathway_idx').agg(agg_dict).reset_index()
-
+    }).reset_index()
+    
     # Flatten column names
-    base_cols = [
+    pathway_stats.columns = [
         'pathway_idx', 'pathway_name',
         'mean_importance', 'std_importance', 'min_importance', 'max_importance',
         'mean_rank', 'std_rank', 'min_rank', 'max_rank'
     ]
-    if has_omic:
-        base_cols += [
-            'mean_mut_attribution', 'std_mut_attribution',
-            'mean_cnv_attribution', 'std_cnv_attribution'
-        ]
-    pathway_stats.columns = base_cols
-
-    # Derive aggregated omic dominance
-    if has_omic:
-        total = pathway_stats['mean_mut_attribution'] + pathway_stats['mean_cnv_attribution'] + 1e-12
-        pathway_stats['mean_mut_pct'] = (pathway_stats['mean_mut_attribution'] / total * 100).round(2)
-        pathway_stats['mean_cnv_pct'] = (pathway_stats['mean_cnv_attribution'] / total * 100).round(2)
-        pathway_stats['omic_dominant'] = pathway_stats['mean_mut_pct'].apply(
-            lambda x: 'MUT' if x >= 50.0 else 'CNV'
-        )
     
     # Sort by mean importance (descending)
     pathway_stats = pathway_stats.sort_values('mean_importance', ascending=False).reset_index(drop=True)
@@ -106,36 +84,26 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
     
     # Display top 20 pathways
     print(f"\nTop 20 Most Consistently Important Pathways (Across {n_folds} Folds):")
-    if has_omic:
-        print("-" * 125)
-        print(f"{'Rank':<6} {'Pathway':<12} {'Name':<32} {'Mean Importance':<26} {'Mean Rank':<18} {'Mut%':<8} {'CNV%':<8} {'Dominant'}")
-        print("-" * 125)
-    else:
-        print("-" * 100)
-        print(f"{'Rank':<6} {'Pathway':<15} {'Name':<35} {'Mean Importance':<18} {'Mean Rank':<12}")
-        print("-" * 100)
-
+    print("-" * 100)
+    print(f"{'Rank':<6} {'Pathway':<15} {'Name':<35} {'Mean Importance':<18} {'Mean Rank':<12}")
+    print("-" * 100)
+    
     for _, row in pathway_stats.head(20).iterrows():
-        display_name = row['pathway_name'][:30] + "..." if len(row['pathway_name']) > 32 else row['pathway_name']
+        display_name = row['pathway_name'][:33] + "..." if len(row['pathway_name']) > 35 else row['pathway_name']
         importance_str = f"{row['mean_importance']:.6f} ± {row['std_importance']:.6f}"
         rank_str = f"{row['mean_rank']:.1f} ± {row['std_rank']:.1f}"
-        if has_omic:
-            print(f"{int(row['overall_rank']):<6} {int(row['pathway_idx']):<12} {display_name:<32} "
-                  f"{importance_str:<26} {rank_str:<18} "
-                  f"{row['mean_mut_pct']:<8.1f} {row['mean_cnv_pct']:<8.1f} {row['omic_dominant']}")
-        else:
-            print(f"{int(row['overall_rank']):<6} {int(row['pathway_idx']):<15} {display_name:<35} "
-                  f"{importance_str:<18} {rank_str:<12}")
-
-    # Save aggregate results (CSV includes all columns automatically)
+        print(f"{int(row['overall_rank']):<6} {int(row['pathway_idx']):<15} {display_name:<35} "
+              f"{importance_str:<18} {rank_str:<12}")
+    
+    # Save aggregate results
     aggregate_csv = os.path.join(pathway_dir, "aggregate_pathway_importance.csv")
     pathway_stats.to_csv(aggregate_csv, index=False)
     print(f"\nAggregate pathway importance saved to: {aggregate_csv}")
-
+    
     # Save top pathways to JSON
     top_pathways = []
     for _, row in pathway_stats.head(20).iterrows():
-        entry = {
+        top_pathways.append({
             'overall_rank': int(row['overall_rank']),
             'pathway_idx': int(row['pathway_idx']),
             'pathway_name': row['pathway_name'],
@@ -143,16 +111,7 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
             'std_importance': float(row['std_importance']),
             'mean_rank': float(row['mean_rank']),
             'std_rank': float(row['std_rank'])
-        }
-        if has_omic:
-            entry.update({
-                'mean_mut_attribution': float(row['mean_mut_attribution']),
-                'mean_cnv_attribution': float(row['mean_cnv_attribution']),
-                'mean_mut_pct': float(row['mean_mut_pct']),
-                'mean_cnv_pct': float(row['mean_cnv_pct']),
-                'omic_dominant': row['omic_dominant']
-            })
-        top_pathways.append(entry)
+        })
     
     aggregate_json = os.path.join(pathway_dir, "aggregate_top_pathways.json")
     with open(aggregate_json, 'w') as f:
@@ -773,7 +732,9 @@ class PathwayGraphTransformer(nn.Module):
         else:
             if self.use_edge_mask:
                 nonedge = (A <= 0)
-                mask = mask.masked_fill(nonedge, -10.0)  # soft penalty for non-edges
+                # CHANGED: Use soft penalty instead of -inf
+                mask = mask.masked_fill(nonedge, -10.0)  # ← ONLY THIS LINE CHANGED!
+                # mask = mask.masked_fill(nonedge, float('-inf'))  # HARD mask
                 mask.fill_diagonal_(0.0)
 
         self.attn_mask = mask.detach()
@@ -881,59 +842,6 @@ def evaluate_metrics(model, loader, device):
         "f1_binary": f1_binary,
         "precision": precision,
         "recall": recall,
-        "best_threshold": best_thr,
-        "y_true": y_true,
-        "y_pred": pred,
-        "y_probs": p1
-    }
-
-@torch.no_grad()
-def evaluate_metrics_with_threshold(model, loader, device, threshold):
-    """
-    Evaluate model using a FIXED threshold (no optimization on this data).
-    Use this for test set evaluation to avoid data leakage.
-
-    Args:
-        model: The model to evaluate
-        loader: DataLoader for the dataset
-        device: torch device
-        threshold: Fixed threshold value (determined from validation set)
-
-    Returns:
-        Dictionary with evaluation metrics
-    """
-    model.eval()
-    all_y, all_p1 = [], []
-    pbar = tqdm(loader, desc="Evaluating", leave=False, ncols=80)
-    for mut_b, cnv_b, y_b in pbar:
-        mut_b, cnv_b, y_b = mut_b.to(device), cnv_b.to(device), y_b.to(device)
-        logits = model(mut_b, cnv_b)
-        probs = logits.softmax(dim=-1)[:,1]
-        all_y.append(y_b.cpu().numpy())
-        all_p1.append(probs.cpu().numpy())
-
-    y_true = np.concatenate(all_y) if all_y else np.array([])
-    p1 = np.concatenate(all_p1) if all_p1 else np.array([])
-
-    # Use FIXED threshold (no optimization on this data)
-    pred = (p1 >= threshold).astype(int)
-
-    acc = accuracy_score(y_true, pred)
-    auc = roc_auc_score(y_true, p1) if y_true.size>0 and len(np.unique(y_true))>1 else float("nan")
-    aupr = average_precision_score(y_true, p1) if y_true.size>0 and len(np.unique(y_true))>1 else float("nan")
-
-    f1_binary = f1_score(y_true, pred, average='binary', zero_division=0)
-    precision = precision_score(y_true, pred, average='binary', zero_division=0)
-    recall = recall_score(y_true, pred, average='binary', zero_division=0)
-
-    return {
-        "acc": acc,
-        "auc": auc,
-        "aupr": aupr,
-        "f1_binary": f1_binary,
-        "precision": precision,
-        "recall": recall,
-        "threshold": threshold,
         "y_true": y_true,
         "y_pred": pred,
         "y_probs": p1
@@ -965,641 +873,84 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
         
-# ===============================
-# Omic Contribution Analysis
-# ===============================
-
-def compute_omic_contributions(model, loader, pathway_gene_lists, device):
-    """
-    Compute per-omic (mutation vs CNV) contribution to each pathway
-    using Gradient × Input attribution.
-
-    For each sample:
-      attr_mut[g] = |grad_logit1 w.r.t. mut[g]| × |mut[g]|
-      attr_cnv[g] = |grad_logit1 w.r.t. cnv[g]| × |cnv[g]|
-
-    Then aggregate gene-level scores to pathway level by averaging
-    across all genes in the pathway.
-
-    Args:
-        model: Trained PathwayGraphTransformer
-        loader: DataLoader (test or val)
-        pathway_gene_lists: List of gene index lists per pathway
-        device: torch device
-
-    Returns:
-        mut_pathway_scores: np.ndarray [num_pathways] – mutation attribution per pathway
-        cnv_pathway_scores: np.ndarray [num_pathways] – CNV attribution per pathway
-        omic_dominance:     np.ndarray [num_pathways] – ratio mut/(mut+cnv+eps)
-        mut_gene_scores:    np.ndarray [num_genes]    – mutation attribution per gene
-        cnv_gene_scores:    np.ndarray [num_genes]    – CNV attribution per gene
-    """
-    model.eval()
-    mut_attrs_all = []
-    cnv_attrs_all = []
-
-    for mut_b, cnv_b, _ in loader:
-        mut_b = mut_b.to(device).float().requires_grad_(True)
-        cnv_b = cnv_b.to(device).float().requires_grad_(True)
-
-        logits = model(mut_b, cnv_b)
-        # Attribute toward the metastatic class (index 1)
-        score = logits[:, 1].sum()
-        score.backward()
-
-        # Gradient × Input (absolute value for magnitude)
-        mut_attr = (mut_b.grad * mut_b).abs().detach().cpu().numpy()   # [B, G]
-        cnv_attr = (cnv_b.grad * cnv_b).abs().detach().cpu().numpy()   # [B, G]
-
-        mut_attrs_all.append(mut_attr)
-        cnv_attrs_all.append(cnv_attr)
-
-    # Average across all samples → [G]
-    mut_gene = np.mean(np.vstack(mut_attrs_all), axis=0)
-    cnv_gene = np.mean(np.vstack(cnv_attrs_all), axis=0)
-
-    # Aggregate gene → pathway by mean over member genes
-    mut_pathway = np.zeros(len(pathway_gene_lists), dtype=np.float32)
-    cnv_pathway = np.zeros(len(pathway_gene_lists), dtype=np.float32)
-    for p, gene_idxs in enumerate(pathway_gene_lists):
-        if len(gene_idxs) > 0:
-            mut_pathway[p] = float(mut_gene[gene_idxs].mean())
-            cnv_pathway[p] = float(cnv_gene[gene_idxs].mean())
-
-    # Dominance: fraction of total attribution from mutation
-    total = mut_pathway + cnv_pathway + 1e-12
-    omic_dominance = mut_pathway / total   # >0.5 → mut-dominant, <0.5 → cnv-dominant
-
-    return mut_pathway, cnv_pathway, omic_dominance, mut_gene, cnv_gene
-
-
-def analyze_and_save_gene_importance(mut_gene_scores, cnv_gene_scores, gene_cols,
-                                     outdir, fold_num, top_k=20):
-    """
-    Identify the top genes driving metastatic progression.
-
-    Ranks genes by total Gradient×Input attribution (mut + cnv) and reports
-    how much of each gene's signal comes from mutation vs CNV.
-
-    Args:
-        mut_gene_scores: np.ndarray [num_genes] – per-gene mutation attribution
-        cnv_gene_scores: np.ndarray [num_genes] – per-gene CNV attribution
-        gene_cols: List of gene names (same order as columns in mut/cnv matrices)
-        outdir: Root output directory
-        fold_num: Current fold number
-        top_k: How many top genes to display and save (default 20)
-
-    Returns:
-        Dictionary with top gene rankings and all gene rankings
-    """
-    gene_dir = os.path.join(outdir, "gene_importance")
-    os.makedirs(gene_dir, exist_ok=True)
-
-    total_gene = mut_gene_scores + cnv_gene_scores          # [G]
-    gene_ranking = np.argsort(-total_gene)                  # descending
-
-    print(f"\n{'='*70}")
-    print(f"GENE IMPORTANCE ANALYSIS - FOLD {fold_num}")
-    print(f"{'='*70}")
-    print(f"\nTop {top_k} Genes for Metastatic Progression:")
-    print("-" * 105)
-    print(f"{'Rank':<6} {'Gene':<20} {'Total Attr':<16} {'Mut Attr':<16} {'CNV Attr':<16} "
-          f"{'Mut%':<8} {'CNV%':<8} {'Dominant'}")
-    print("-" * 105)
-
-    top_gene_results = []
-    for rank, idx in enumerate(gene_ranking[:top_k], 1):
-        gene_name = gene_cols[idx] if idx < len(gene_cols) else f"Gene_{idx}"
-        total  = float(total_gene[idx])
-        m_s    = float(mut_gene_scores[idx])
-        c_s    = float(cnv_gene_scores[idx])
-        dom    = m_s / (total + 1e-12)
-        dominant = "MUT" if dom >= 0.5 else "CNV"
-        mut_pct = dom * 100
-        cnv_pct = (1 - dom) * 100
-
-        print(f"{rank:<6} {gene_name:<20} {total:<16.8f} {m_s:<16.8f} {c_s:<16.8f} "
-              f"{mut_pct:<8.1f} {cnv_pct:<8.1f} {dominant}")
-
-        top_gene_results.append({
-            'rank': rank,
-            'gene_idx': int(idx),
-            'gene_name': gene_name,
-            'total_attribution': total,
-            'mut_attribution': m_s,
-            'cnv_attribution': c_s,
-            'mut_pct': round(mut_pct, 2),
-            'cnv_pct': round(cnv_pct, 2),
-            'omic_dominant': dominant
-        })
-
-    # Build full ranking for CSV (all genes)
-    all_gene_rankings = []
-    for rank, idx in enumerate(gene_ranking, 1):
-        gene_name = gene_cols[idx] if idx < len(gene_cols) else f"Gene_{idx}"
-        total  = float(total_gene[idx])
-        m_s    = float(mut_gene_scores[idx])
-        c_s    = float(cnv_gene_scores[idx])
-        dom    = m_s / (total + 1e-12)
-        all_gene_rankings.append({
-            'fold': fold_num,
-            'rank': rank,
-            'gene_idx': int(idx),
-            'gene_name': gene_name,
-            'total_attribution': total,
-            'mut_attribution': m_s,
-            'cnv_attribution': c_s,
-            'mut_pct': round(dom * 100, 2),
-            'cnv_pct': round((1 - dom) * 100, 2),
-            'omic_dominant': "MUT" if dom >= 0.5 else "CNV"
-        })
-
-    # Save full CSV
-    csv_file = os.path.join(gene_dir, f"gene_importance_fold{fold_num}.csv")
-    pd.DataFrame(all_gene_rankings).to_csv(csv_file, index=False)
-    print(f"\nComplete gene rankings saved to: {csv_file}")
-
-    # Save top-k JSON
-    json_file = os.path.join(gene_dir, f"top_genes_fold{fold_num}.json")
-    with open(json_file, 'w') as f:
-        json.dump({
-            'fold': fold_num,
-            'top_genes': top_gene_results,
-            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }, f, indent=2)
-    print(f"Top {top_k} genes saved to: {json_file}")
-
-    return {'fold': fold_num, 'top_genes': top_gene_results, 'all_gene_rankings': all_gene_rankings}
-
-
-def analyze_top_genes_per_pathway(top_pathways, mut_gene_scores, cnv_gene_scores,
-                                   pathway_gene_lists, gene_cols, outdir, fold_num,
-                                   top_k_genes=10):
-    """
-    For each of the top pathways, rank the genes inside that pathway by
-    Gradient×Input attribution and show how much each gene's signal comes
-    from mutation vs CNV.
-
-    Args:
-        top_pathways:      List of dicts from analyze_and_save_pathway_importance()
-                           (each has 'rank', 'pathway_idx', 'pathway_name', 'importance_score')
-        mut_gene_scores:   np.ndarray [num_genes] – per-gene mutation attribution
-        cnv_gene_scores:   np.ndarray [num_genes] – per-gene CNV attribution
-        pathway_gene_lists: List of gene-index lists per pathway
-        gene_cols:         List of gene names
-        outdir:            Root output directory
-        fold_num:          Current fold number
-        top_k_genes:       How many top genes to show per pathway (default 10)
-
-    Returns:
-        List of flat row dicts (pathway_idx, gene_name, omic scores, …)
-    """
-    pg_dir = os.path.join(outdir, "pathway_gene_importance")
-    os.makedirs(pg_dir, exist_ok=True)
-
-    print(f"\n{'='*70}")
-    print(f"TOP GENES PER PATHWAY - FOLD {fold_num}")
-    print(f"{'='*70}")
-
-    all_rows = []
-    pathway_json_list = []
-
-    for pw_entry in top_pathways:
-        pw_rank  = pw_entry['rank']
-        pw_idx   = pw_entry['pathway_idx']
-        pw_name  = pw_entry['pathway_name']
-        pw_score = pw_entry['importance_score']
-
-        gene_idxs = pathway_gene_lists[pw_idx]
-        if len(gene_idxs) == 0:
-            continue
-
-        # Score and rank genes within this pathway only
-        pw_total = np.array([float(mut_gene_scores[g] + cnv_gene_scores[g]) for g in gene_idxs])
-        local_ranking = np.argsort(-pw_total)        # indices into gene_idxs
-
-        show_k = min(top_k_genes, len(gene_idxs))
-        print(f"\n  Pathway #{pw_rank}: {pw_name}  (importance={pw_score:.6f}, {len(gene_idxs)} genes)")
-        print(f"  {'Rank':<5} {'Gene':<20} {'Total Attr':<16} {'Mut Attr':<16} {'CNV Attr':<16} "
-              f"{'Mut%':<8} {'CNV%':<8} {'Dominant'}")
-        print(f"  {'-'*95}")
-
-        pw_gene_entries = []
-        for gene_rank, pos in enumerate(local_ranking[:show_k], 1):
-            g_idx     = gene_idxs[pos]
-            gene_name = gene_cols[g_idx] if g_idx < len(gene_cols) else f"Gene_{g_idx}"
-            total = float(mut_gene_scores[g_idx] + cnv_gene_scores[g_idx])
-            m_s   = float(mut_gene_scores[g_idx])
-            c_s   = float(cnv_gene_scores[g_idx])
-            dom   = m_s / (total + 1e-12)
-            dominant = "MUT" if dom >= 0.5 else "CNV"
-            mut_pct  = dom * 100
-            cnv_pct  = (1 - dom) * 100
-
-            print(f"  {gene_rank:<5} {gene_name:<20} {total:<16.8f} {m_s:<16.8f} {c_s:<16.8f} "
-                  f"{mut_pct:<8.1f} {cnv_pct:<8.1f} {dominant}")
-
-            row = {
-                'fold': fold_num,
-                'pathway_rank': pw_rank,
-                'pathway_idx': pw_idx,
-                'pathway_name': pw_name,
-                'pathway_importance': pw_score,
-                'gene_rank_in_pathway': gene_rank,
-                'gene_idx': int(g_idx),
-                'gene_name': gene_name,
-                'total_attribution': total,
-                'mut_attribution': m_s,
-                'cnv_attribution': c_s,
-                'mut_pct': round(mut_pct, 2),
-                'cnv_pct': round(cnv_pct, 2),
-                'omic_dominant': dominant
-            }
-            all_rows.append(row)
-            pw_gene_entries.append({
-                'gene_rank': gene_rank,
-                'gene_name': gene_name,
-                'total_attribution': total,
-                'mut_attribution': m_s,
-                'cnv_attribution': c_s,
-                'mut_pct': round(mut_pct, 2),
-                'cnv_pct': round(cnv_pct, 2),
-                'omic_dominant': dominant
-            })
-
-        pathway_json_list.append({
-            'pathway_rank': pw_rank,
-            'pathway_idx': pw_idx,
-            'pathway_name': pw_name,
-            'pathway_importance': pw_score,
-            'top_genes': pw_gene_entries
-        })
-
-    # Save flat CSV
-    csv_file = os.path.join(pg_dir, f"pathway_gene_importance_fold{fold_num}.csv")
-    pd.DataFrame(all_rows).to_csv(csv_file, index=False)
-    print(f"\nPathway-gene importance saved to: {csv_file}")
-
-    # Save structured JSON
-    json_file = os.path.join(pg_dir, f"pathway_top_genes_fold{fold_num}.json")
-    with open(json_file, 'w') as f:
-        json.dump({
-            'fold': fold_num,
-            'pathways': pathway_json_list,
-            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }, f, indent=2)
-    print(f"Pathway-gene JSON saved to: {json_file}")
-
-    return all_rows
-
-
-def aggregate_pathway_gene_rankings_across_folds(outdir, n_folds=5):
-    """
-    Aggregate per-pathway gene importance across all CV folds.
-
-    For each (pathway, gene) pair seen in the top pathways, computes
-    mean/std of attribution scores and reports the consistent top genes
-    per pathway across folds.
-
-    Args:
-        outdir:   Root output directory
-        n_folds:  Number of CV folds
-
-    Returns:
-        DataFrame with aggregate pathway-gene statistics, or None if no data found
-    """
-    pg_dir = os.path.join(outdir, "pathway_gene_importance")
-    if not os.path.exists(pg_dir):
-        print(f"Warning: Pathway-gene importance directory not found: {pg_dir}")
-        return None
-
-    print(f"\n{'='*70}")
-    print("AGGREGATING PATHWAY-GENE IMPORTANCE ACROSS ALL FOLDS")
-    print(f"{'='*70}")
-
-    all_fold_data = []
-    for fold in range(1, n_folds + 1):
-        csv_file = os.path.join(pg_dir, f"pathway_gene_importance_fold{fold}.csv")
-        if os.path.exists(csv_file):
-            all_fold_data.append(pd.read_csv(csv_file))
-            print(f"Loaded fold {fold} pathway-gene data")
-        else:
-            print(f"Warning: Missing fold {fold}: {csv_file}")
-
-    if not all_fold_data:
-        print("Error: No pathway-gene fold data found!")
-        return None
-
-    combined = pd.concat(all_fold_data, ignore_index=True)
-
-    stats = combined.groupby(['pathway_idx', 'gene_idx']).agg(
-        pathway_name=('pathway_name', 'first'),
-        gene_name=('gene_name', 'first'),
-        mean_pathway_rank=('pathway_rank', 'mean'),
-        mean_total=('total_attribution', 'mean'),
-        std_total=('total_attribution', 'std'),
-        mean_mut=('mut_attribution', 'mean'),
-        std_mut=('mut_attribution', 'std'),
-        mean_cnv=('cnv_attribution', 'mean'),
-        std_cnv=('cnv_attribution', 'std'),
-        mean_gene_rank=('gene_rank_in_pathway', 'mean'),
-        std_gene_rank=('gene_rank_in_pathway', 'std')
-    ).reset_index()
-
-    total = stats['mean_mut'] + stats['mean_cnv'] + 1e-12
-    stats['mean_mut_pct'] = (stats['mean_mut'] / total * 100).round(2)
-    stats['mean_cnv_pct'] = (stats['mean_cnv'] / total * 100).round(2)
-    stats['omic_dominant'] = stats['mean_mut_pct'].apply(lambda x: 'MUT' if x >= 50.0 else 'CNV')
-
-    # Print top genes per pathway (sorted by mean_total within each pathway)
-    pathway_groups = stats.sort_values('mean_pathway_rank')
-    for pw_idx, pw_df in pathway_groups.groupby('pathway_idx', sort=False):
-        pw_name = pw_df['pathway_name'].iloc[0]
-        pw_rank = pw_df['mean_pathway_rank'].iloc[0]
-        top_genes = pw_df.sort_values('mean_total', ascending=False).head(10)
-
-        print(f"\n  Pathway #{int(pw_rank)}: {pw_name}")
-        print(f"  {'Gene':<20} {'Mean Total Attr':<28} {'Mut%':<8} {'CNV%':<8} {'Dominant'}")
-        print(f"  {'-'*72}")
-        for _, row in top_genes.iterrows():
-            total_str = f"{row['mean_total']:.8f} ± {row['std_total']:.8f}"
-            print(f"  {row['gene_name']:<20} {total_str:<28} "
-                  f"{row['mean_mut_pct']:<8.1f} {row['mean_cnv_pct']:<8.1f} {row['omic_dominant']}")
-
-    # Save aggregate CSV
-    agg_csv = os.path.join(pg_dir, "aggregate_pathway_gene_importance.csv")
-    stats.sort_values(['mean_pathway_rank', 'mean_total'], ascending=[True, False]).to_csv(agg_csv, index=False)
-    print(f"\nAggregate pathway-gene importance saved to: {agg_csv}")
-
-    # Save structured JSON
-    agg_json_data = []
-    for pw_idx, pw_df in pathway_groups.groupby('pathway_idx', sort=False):
-        top_genes = pw_df.sort_values('mean_total', ascending=False).head(10)
-        agg_json_data.append({
-            'pathway_idx': int(pw_idx),
-            'pathway_name': pw_df['pathway_name'].iloc[0],
-            'mean_pathway_rank': float(pw_df['mean_pathway_rank'].iloc[0]),
-            'top_genes': [
-                {
-                    'gene_name': row['gene_name'],
-                    'mean_total_attribution': float(row['mean_total']),
-                    'std_total_attribution': float(row['std_total']),
-                    'mean_mut_attribution': float(row['mean_mut']),
-                    'mean_cnv_attribution': float(row['mean_cnv']),
-                    'mean_mut_pct': float(row['mean_mut_pct']),
-                    'mean_cnv_pct': float(row['mean_cnv_pct']),
-                    'omic_dominant': row['omic_dominant']
-                }
-                for _, row in top_genes.iterrows()
-            ]
-        })
-
-    agg_json = os.path.join(pg_dir, "aggregate_pathway_top_genes.json")
-    with open(agg_json, 'w') as f:
-        json.dump({
-            'n_folds': n_folds,
-            'pathways': agg_json_data,
-            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }, f, indent=2)
-    print(f"Aggregate pathway-gene JSON saved to: {agg_json}")
-
-    print(f"{'='*70}\n")
-    return stats
-
-
-def aggregate_gene_rankings_across_folds(outdir, n_folds=5):
-    """
-    Aggregate gene importance rankings across all CV folds.
-
-    Reads per-fold gene_importance CSVs, groups by gene, computes mean/std
-    of total, mut, and cnv attribution, derives omic dominance, and saves
-    the aggregate ranking.
-
-    Args:
-        outdir: Root output directory (same as passed to main)
-        n_folds: Number of CV folds
-
-    Returns:
-        DataFrame with aggregate gene statistics, or None if no data found
-    """
-    gene_dir = os.path.join(outdir, "gene_importance")
-    if not os.path.exists(gene_dir):
-        print(f"Warning: Gene importance directory not found: {gene_dir}")
-        return None
-
-    print(f"\n{'='*70}")
-    print("AGGREGATING GENE IMPORTANCE ACROSS ALL FOLDS")
-    print(f"{'='*70}")
-
-    all_fold_data = []
-    for fold in range(1, n_folds + 1):
-        csv_file = os.path.join(gene_dir, f"gene_importance_fold{fold}.csv")
-        if os.path.exists(csv_file):
-            df = pd.read_csv(csv_file)
-            all_fold_data.append(df)
-            print(f"Loaded fold {fold} gene data: {len(df)} genes")
-        else:
-            print(f"Warning: Missing fold {fold} data: {csv_file}")
-
-    if not all_fold_data:
-        print("Error: No gene fold data found!")
-        return None
-
-    combined_df = pd.concat(all_fold_data, ignore_index=True)
-
-    gene_stats = combined_df.groupby('gene_idx').agg(
-        gene_name=('gene_name', 'first'),
-        mean_total=('total_attribution', 'mean'),
-        std_total=('total_attribution', 'std'),
-        mean_mut=('mut_attribution', 'mean'),
-        std_mut=('mut_attribution', 'std'),
-        mean_cnv=('cnv_attribution', 'mean'),
-        std_cnv=('cnv_attribution', 'std'),
-        mean_rank=('rank', 'mean'),
-        std_rank=('rank', 'std')
-    ).reset_index()
-
-    gene_stats = gene_stats.sort_values('mean_total', ascending=False).reset_index(drop=True)
-    gene_stats['overall_rank'] = range(1, len(gene_stats) + 1)
-
-    total = gene_stats['mean_mut'] + gene_stats['mean_cnv'] + 1e-12
-    gene_stats['mean_mut_pct'] = (gene_stats['mean_mut'] / total * 100).round(2)
-    gene_stats['mean_cnv_pct'] = (gene_stats['mean_cnv'] / total * 100).round(2)
-    gene_stats['omic_dominant'] = gene_stats['mean_mut_pct'].apply(
-        lambda x: 'MUT' if x >= 50.0 else 'CNV'
-    )
-
-    # Display top 20
-    print(f"\nTop 20 Genes for Metastatic Progression (Across {n_folds} Folds):")
-    print("-" * 120)
-    print(f"{'Rank':<6} {'Gene':<20} {'Mean Total Attr':<22} {'Mean Mut Attr':<20} "
-          f"{'Mean CNV Attr':<20} {'Mut%':<8} {'CNV%':<8} {'Dominant'}")
-    print("-" * 120)
-    for _, row in gene_stats.head(20).iterrows():
-        total_str = f"{row['mean_total']:.8f} ± {row['std_total']:.8f}"
-        mut_str   = f"{row['mean_mut']:.6f} ± {row['std_mut']:.6f}"
-        cnv_str   = f"{row['mean_cnv']:.6f} ± {row['std_cnv']:.6f}"
-        print(f"{int(row['overall_rank']):<6} {row['gene_name']:<20} {total_str:<22} "
-              f"{mut_str:<20} {cnv_str:<20} "
-              f"{row['mean_mut_pct']:<8.1f} {row['mean_cnv_pct']:<8.1f} {row['omic_dominant']}")
-
-    # Save CSV
-    aggregate_csv = os.path.join(gene_dir, "aggregate_gene_importance.csv")
-    gene_stats.to_csv(aggregate_csv, index=False)
-    print(f"\nAggregate gene importance saved to: {aggregate_csv}")
-
-    # Save top-20 JSON
-    top_genes = []
-    for _, row in gene_stats.head(20).iterrows():
-        top_genes.append({
-            'overall_rank': int(row['overall_rank']),
-            'gene_idx': int(row['gene_idx']),
-            'gene_name': row['gene_name'],
-            'mean_total_attribution': float(row['mean_total']),
-            'std_total_attribution': float(row['std_total']),
-            'mean_mut_attribution': float(row['mean_mut']),
-            'mean_cnv_attribution': float(row['mean_cnv']),
-            'mean_mut_pct': float(row['mean_mut_pct']),
-            'mean_cnv_pct': float(row['mean_cnv_pct']),
-            'omic_dominant': row['omic_dominant']
-        })
-
-    aggregate_json = os.path.join(gene_dir, "aggregate_top_genes.json")
-    with open(aggregate_json, 'w') as f:
-        json.dump({
-            'n_folds': n_folds,
-            'top_genes': top_genes,
-            'total_genes_analyzed': len(gene_stats),
-            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }, f, indent=2)
-    print(f"Aggregate top genes saved to: {aggregate_json}")
-
-    print(f"{'='*70}\n")
-    return gene_stats
-
-
 # finding important pathways
-def analyze_and_save_pathway_importance(model, test_loader, pathway_names, device, outdir, fold_num,
-                                        pathway_gene_lists=None, top_k=10):
+def analyze_and_save_pathway_importance(model, test_loader, pathway_names, device, outdir, fold_num, top_k=10):
     """
-    Analyze pathway importance and save top influential pathways.
-    When pathway_gene_lists is provided, also computes per-omic (mutation vs CNV)
-    contribution to each pathway via Gradient×Input attribution.
-
+    Analyze pathway importance and save top influential pathways
+    
     Args:
         model: Trained model
-        test_loader: Test data loader
+        val_loader: Validation data loader
         pathway_names: List of pathway names
         device: torch device
         outdir: Output directory
         fold_num: Current fold number
-        pathway_gene_lists: List of gene-index lists per pathway (required for omic contribution)
         top_k: Number of top pathways to display and save
-
+    
     Returns:
-        Dictionary with pathway rankings and scores (including omic contributions if available)
+        Dictionary with pathway rankings and scores
     """
     model.eval()
     all_pathway_weights = []
-
+    
     print(f"\n{'='*70}")
     print(f"PATHWAY IMPORTANCE ANALYSIS - FOLD {fold_num}")
     print(f"{'='*70}")
-
+    
     with torch.no_grad():
         for mut_b, cnv_b, _ in test_loader:
             mut_b, cnv_b = mut_b.to(device), cnv_b.to(device)
             _, extras = model(mut_b, cnv_b, return_extras=True)
             all_pathway_weights.append(extras["pathway_weights"].cpu().numpy())
-
-    # Calculate mean importance across all test samples
+    
+    # Calculate mean importance across all validation samples
     mean_pathway_weights = np.mean(np.vstack(all_pathway_weights), axis=0)
-
-    # ── Omic contribution via Gradient × Input ──────────────────────────────
-    mut_pw_scores = cnv_pw_scores = omic_dominance = None
-    if pathway_gene_lists is not None:
-        print("  Computing omic contributions (Gradient × Input)...")
-        mut_pw_scores, cnv_pw_scores, omic_dominance, mut_gene_scores, cnv_gene_scores = \
-            compute_omic_contributions(model, test_loader, pathway_gene_lists, device)
-        print("  Omic contribution computed.")
-    # ────────────────────────────────────────────────────────────────────────
-
+    
     # Rank pathways by importance (descending)
     pathway_ranking = np.argsort(-mean_pathway_weights)
-
+    
     # Display top pathways
-    has_omic = mut_pw_scores is not None
-    if has_omic:
-        print(f"\nTop {top_k} Most Influential Pathways (with Omic Contribution):")
-        print("-" * 110)
-        print(f"{'Rank':<6} {'Pathway ID':<12} {'Pathway Name':<38} {'Score':<12} {'Mut%':<10} {'CNV%':<10} {'Dominant':<10}")
-        print("-" * 110)
-    else:
-        print(f"\nTop {top_k} Most Influential Pathways:")
-        print("-" * 80)
-        print(f"{'Rank':<6} {'Pathway ID':<15} {'Pathway Name':<40} {'Score':<12}")
-        print("-" * 80)
-
+    print(f"\nTop {top_k} Most Influential Pathways:")
+    print("-" * 80)
+    print(f"{'Rank':<6} {'Pathway ID':<15} {'Pathway Name':<40} {'Score':<12}")
+    print("-" * 80)
+    
     pathway_results = []
     for rank, idx in enumerate(pathway_ranking[:top_k], 1):
         pathway_name = pathway_names[idx] if idx < len(pathway_names) else f"Pathway_{idx}"
         score = mean_pathway_weights[idx]
-        display_name = pathway_name[:36] + "..." if len(pathway_name) > 38 else pathway_name
-
-        entry = {
+        
+        # Truncate long names for display
+        display_name = pathway_name[:38] + "..." if len(pathway_name) > 40 else pathway_name
+        
+        print(f"{rank:<6} {idx:<15} {display_name:<40} {score:.8f}")
+        
+        pathway_results.append({
             'rank': rank,
             'pathway_idx': int(idx),
             'pathway_name': pathway_name,
             'importance_score': float(score)
-        }
-
-        if has_omic:
-            m_s = float(mut_pw_scores[idx])
-            c_s = float(cnv_pw_scores[idx])
-            dom = float(omic_dominance[idx])
-            dominant = "MUT" if dom >= 0.5 else "CNV"
-            mut_pct = dom * 100
-            cnv_pct = (1 - dom) * 100
-            print(f"{rank:<6} {idx:<12} {display_name:<38} {score:<12.8f} {mut_pct:<10.1f} {cnv_pct:<10.1f} {dominant:<10}")
-            entry.update({
-                'mut_attribution': m_s,
-                'cnv_attribution': c_s,
-                'mut_pct': round(mut_pct, 2),
-                'cnv_pct': round(cnv_pct, 2),
-                'omic_dominant': dominant
-            })
-        else:
-            print(f"{rank:<6} {idx:<15} {display_name:<40} {score:.8f}")
-
-        pathway_results.append(entry)
-
+        })
+    
     # Save complete rankings to CSV
     all_rankings = []
     for rank, idx in enumerate(pathway_ranking, 1):
         pathway_name = pathway_names[idx] if idx < len(pathway_names) else f"Pathway_{idx}"
-        row = {
+        all_rankings.append({
             'fold': fold_num,
             'rank': rank,
             'pathway_idx': int(idx),
             'pathway_name': pathway_name,
             'importance_score': float(mean_pathway_weights[idx])
-        }
-        if has_omic:
-            dom = float(omic_dominance[idx])
-            row.update({
-                'mut_attribution': float(mut_pw_scores[idx]),
-                'cnv_attribution': float(cnv_pw_scores[idx]),
-                'mut_pct': round(dom * 100, 2),
-                'cnv_pct': round((1 - dom) * 100, 2),
-                'omic_dominant': "MUT" if dom >= 0.5 else "CNV"
-            })
-        all_rankings.append(row)
-
+        })
+    
+    # Save to CSV
     csv_file = os.path.join(outdir, f"pathway_importance_fold{fold_num}.csv")
     df_rankings = pd.DataFrame(all_rankings)
     df_rankings.to_csv(csv_file, index=False)
     print(f"\nComplete pathway rankings saved to: {csv_file}")
-
+    
+    # Save top pathways to JSON
     json_file = os.path.join(outdir, f"top_pathways_fold{fold_num}.json")
     with open(json_file, 'w') as f:
         json.dump({
@@ -1608,94 +959,13 @@ def analyze_and_save_pathway_importance(model, test_loader, pathway_names, devic
             'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }, f, indent=2)
     print(f"Top {top_k} pathways saved to: {json_file}")
-
-    result = {
+    
+    return {
         'fold': fold_num,
         'top_pathways': pathway_results,
         'all_rankings': all_rankings,
         'mean_scores': mean_pathway_weights
     }
-    if has_omic:
-        result['mut_gene_scores'] = mut_gene_scores
-        result['cnv_gene_scores'] = cnv_gene_scores
-    return result
-# ===============================
-# Checkpoint / Resume Helpers
-# ===============================
-
-def save_progress_checkpoint(outdir, completed_folds,
-                              all_fold_val_metrics, all_fold_test_metrics,
-                              all_fold_details, all_fold_predictions,
-                              all_test_y_true, all_test_y_pred, all_test_y_probs):
-    """
-    Save training progress so a interrupted run can resume from the last
-    completed fold.
-
-    Per-fold prediction DataFrames are saved as individual CSVs because
-    pandas DataFrames are not JSON-serialisable.  Everything else goes into
-    a single JSON file.
-
-    Files written:
-        {outdir}/checkpoint_progress.json
-        {outdir}/checkpoint_fold{N}_predictions.csv  (one per completed fold)
-    """
-    os.makedirs(outdir, exist_ok=True)
-
-    # Save per-fold prediction DataFrames as CSV
-    for fold_num, df in zip(completed_folds, all_fold_predictions):
-        pred_path = os.path.join(outdir, f"checkpoint_fold{fold_num}_predictions.csv")
-        df.to_csv(pred_path, index=False)
-
-    checkpoint = {
-        'completed_folds': completed_folds,
-        'all_fold_val_metrics': all_fold_val_metrics,
-        'all_fold_test_metrics': all_fold_test_metrics,
-        'all_fold_details': all_fold_details,
-        'all_test_y_true':  [arr.tolist() for arr in all_test_y_true],
-        'all_test_y_pred':  [arr.tolist() for arr in all_test_y_pred],
-        'all_test_y_probs': [arr.tolist() for arr in all_test_y_probs],
-    }
-
-    checkpoint_path = os.path.join(outdir, 'checkpoint_progress.json')
-    with open(checkpoint_path, 'w') as f:
-        json.dump(checkpoint, f)
-
-    print(f"  [Checkpoint] Fold {completed_folds[-1]} saved → {checkpoint_path}")
-
-
-def load_progress_checkpoint(outdir):
-    """
-    Load a previously saved checkpoint.
-
-    Returns a dict with restored state (numpy arrays and DataFrames
-    reconstructed), or None if no checkpoint exists.
-    """
-    checkpoint_path = os.path.join(outdir, 'checkpoint_progress.json')
-    if not os.path.exists(checkpoint_path):
-        return None
-
-    with open(checkpoint_path, 'r') as f:
-        checkpoint = json.load(f)
-
-    # Restore numpy arrays
-    checkpoint['all_test_y_true']  = [np.array(a) for a in checkpoint['all_test_y_true']]
-    checkpoint['all_test_y_pred']  = [np.array(a) for a in checkpoint['all_test_y_pred']]
-    checkpoint['all_test_y_probs'] = [np.array(a) for a in checkpoint['all_test_y_probs']]
-
-    # Restore per-fold prediction DataFrames
-    all_fold_predictions = []
-    for fold_num in checkpoint['completed_folds']:
-        pred_path = os.path.join(outdir, f"checkpoint_fold{fold_num}_predictions.csv")
-        if os.path.exists(pred_path):
-            all_fold_predictions.append(pd.read_csv(pred_path))
-        else:
-            print(f"  [Checkpoint Warning] Missing prediction file for fold {fold_num}, skipping.")
-            all_fold_predictions.append(pd.DataFrame())
-    checkpoint['all_fold_predictions'] = all_fold_predictions
-
-    return checkpoint
-
-
 # ===============================
 # MAIN FUNCTION - 5-FOLD CV
 # ===============================
@@ -1721,18 +991,9 @@ def main_5fold_cv():
     ap.add_argument("--use_batch_norm", action='store_true', default=True)
     ap.add_argument("--pe_dim", type=int, default=16)
     ap.add_argument("--use_edge_aware_blocks", action='store_true', default=True)
-    ap.add_argument("--use_full_graph", action='store_true',
+    ap.add_argument("--use_full_graph", action='store_true', 
                     help="Use fully connected graph (all pathways attend to all) instead of sparse adjacency")
-    ap.add_argument("--early_stopping_metric", default="f1_binary",
-                    choices=["auc", "f1_binary", "aupr", "acc"],
-                    help="Metric to use for early stopping and model selection (default: f1_binary)")
-    ap.add_argument("--use_lr_scheduler", action='store_true', default=True,
-                    help="Use ReduceLROnPlateau learning rate scheduler")
-    ap.add_argument("--lr_scheduler_patience", type=int, default=10,
-                    help="Patience for learning rate scheduler")
-    ap.add_argument("--lr_scheduler_factor", type=float, default=0.5,
-                    help="Factor to reduce learning rate by")
-
+    
     args = ap.parse_args()
 
     print(f"\n{'='*70}")
@@ -1741,9 +1002,6 @@ def main_5fold_cv():
     print(f"Model: Improved Graph Transformer (Dwivedi & Bresson)")
     print(f"CV Strategy: 5-Fold Stratified (1 fold test, 4 folds train, 10% of train as val)")
     print(f"Expected splits per fold: ~72% train, ~8% val, ~20% test")
-    print(f"Early Stopping Metric: {args.early_stopping_metric.upper()}")
-    print(f"Learning Rate Scheduler: {'ENABLED' if args.use_lr_scheduler else 'DISABLED'}")
-    print(f"Focal Loss: {'ENABLED' if args.use_focal_loss else 'DISABLED'}")
     print(f"{'='*70}\n")
     
     os.makedirs(args.outdir, exist_ok=True)
@@ -1782,30 +1040,12 @@ def main_5fold_cv():
     all_fold_test_metrics = []
     all_fold_details = []
     all_fold_predictions = []
-
+    
     # Storage for aggregate visualizations
     all_test_y_true = []
     all_test_y_pred = []
     all_test_y_probs = []
-
-    # ── Checkpoint / Resume ──────────────────────────────────────────────────
-    completed_folds = []
-    checkpoint = load_progress_checkpoint(args.outdir)
-    if checkpoint:
-        completed_folds       = checkpoint['completed_folds']
-        all_fold_val_metrics  = checkpoint['all_fold_val_metrics']
-        all_fold_test_metrics = checkpoint['all_fold_test_metrics']
-        all_fold_details      = checkpoint['all_fold_details']
-        all_fold_predictions  = checkpoint['all_fold_predictions']
-        all_test_y_true       = checkpoint['all_test_y_true']
-        all_test_y_pred       = checkpoint['all_test_y_pred']
-        all_test_y_probs      = checkpoint['all_test_y_probs']
-        print(f"\n[RESUME] Checkpoint found — folds already done: {completed_folds}")
-        print(f"[RESUME] Resuming from fold {max(completed_folds) + 1}")
-    else:
-        print(f"\n[RESUME] No checkpoint found — starting from fold 1")
-    # ─────────────────────────────────────────────────────────────────────────
-
+    
     print(f"\nStarting 5-fold CV evaluation...")
     
     # MAIN FOLD LOOP
@@ -1816,13 +1056,7 @@ def main_5fold_cv():
         test_idx = np.array(fold_data['test_idx'])
         
         print(f"\n{'='*50} FOLD {fold}/5 {'='*50}")
-
-        # ── Resume: skip this fold if already done ───────────────────────────
-        if fold in completed_folds:
-            print(f"  [Checkpoint] Fold {fold} already completed — skipping.")
-            continue
-        # ─────────────────────────────────────────────────────────────────────
-
+        
         # Set seed
         set_seed(args.random_state + fold)
         
@@ -1865,19 +1099,6 @@ def main_5fold_cv():
         # Optimizer and loss
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-        # Learning rate scheduler
-        scheduler = None
-        if args.use_lr_scheduler:
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt,
-                mode='max',
-                factor=args.lr_scheduler_factor,
-                patience=args.lr_scheduler_patience,
-                verbose=True,
-                min_lr=1e-7
-            )
-            print(f"Using ReduceLROnPlateau scheduler (patience={args.lr_scheduler_patience}, factor={args.lr_scheduler_factor})")
-
         classes = np.unique(y_tr.numpy())
         weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_tr.numpy())
         weights = torch.tensor(weights, dtype=torch.float32).to(device)
@@ -1891,37 +1112,27 @@ def main_5fold_cv():
         epochs_no_improve = 0
         best_epoch = 0
         best_model_state = None
-        best_threshold = 0.5  # Store best threshold from validation set
-
+        
         # Training loop
-        metric_name = args.early_stopping_metric.upper()
         print(f"\nTraining fold {fold}...")
-        print(f"Early stopping criterion: {metric_name}")
-
         for epoch in range(1, args.epochs + 1):
             tr_loss = train_one_epoch(model, train_loader, opt, criterion, device)
             val_metrics = evaluate_metrics(model, val_loader, device)
-            val_metric = val_metrics[args.early_stopping_metric]  # Use configurable metric
-
+            val_metric = val_metrics["auc"]
+            
             if val_metric > best_val_metric:
                 best_val_metric = val_metric
                 epochs_no_improve = 0
                 best_epoch = epoch
-                best_model_state = copy.deepcopy(model.state_dict())
-                # IMPORTANT: Save threshold determined on validation set
-                best_threshold = val_metrics["best_threshold"]
+                # best_model_state = model.state_dict().copy()
+                best_model_state = copy.deepcopy(model.state_dict())  # ✓ CORRECT
 
             else:
                 epochs_no_improve += 1
-
-            # Learning rate scheduler step
-            if scheduler is not None:
-                scheduler.step(val_metric)
-
+            
             if epoch % 10 == 0 or epoch <= 5:
-                current_lr = opt.param_groups[0]['lr']
-                print(f"Epoch {epoch:3d} | Loss: {tr_loss:.4f} | Val {metric_name}: {val_metric:.4f} | "
-                      f"LR: {current_lr:.2e} | Patience: {epochs_no_improve}/{args.patience}")
+                print(f"Epoch {epoch:3d} | Loss: {tr_loss:.4f} | Val AUC: {val_metric:.4f} | "
+                      f"Patience: {epochs_no_improve}/{args.patience}")
             
             if epoch >= args.min_epochs and epochs_no_improve >= args.patience:
                 print(f"\nEarly stopping at epoch {epoch}")
@@ -1932,14 +1143,16 @@ def main_5fold_cv():
             best_model_path = os.path.join(args.outdir, f"best_model_fold{fold}.pt")
             torch.save(best_model_state, best_model_path)
             model.load_state_dict(best_model_state)
-
-        # Evaluate validation set to get final validation metrics
+        
         final_val_metrics = evaluate_metrics(model, val_loader, device)
-
-        # CRITICAL: Use FIXED threshold from validation set for test evaluation
-        # This prevents data leakage and gives unbiased test performance
-        print(f"\nUsing threshold={best_threshold:.4f} (from validation set) for test evaluation")
-        test_metrics = evaluate_metrics_with_threshold(model, test_loader, device, best_threshold)
+        test_metrics = evaluate_metrics(model, test_loader, device)
+        
+        # Load best model and evaluate
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        
+        final_val_metrics = evaluate_metrics(model, val_loader, device)
+        test_metrics = evaluate_metrics(model, test_loader, device)
         
         # ===== ADD THIS SECTION =====
         # Analyze pathway importance for this fold
@@ -1953,32 +1166,10 @@ def main_5fold_cv():
             device=device,
             outdir=pathway_importance_dir,
             fold_num=fold,
-            pathway_gene_lists=pathway_gene_lists,   # enables omic contribution
             top_k=10  # Change this to get more/fewer top pathways
         )
-        # Gene-level omic contribution analysis (top genes for metastatic progression)
-        if 'mut_gene_scores' in pathway_analysis:
-            analyze_and_save_gene_importance(
-                mut_gene_scores=pathway_analysis['mut_gene_scores'],
-                cnv_gene_scores=pathway_analysis['cnv_gene_scores'],
-                gene_cols=gene_cols,
-                outdir=args.outdir,
-                fold_num=fold,
-                top_k=20
-            )
-            # Top genes within each of the top 10 pathways
-            analyze_top_genes_per_pathway(
-                top_pathways=pathway_analysis['top_pathways'],
-                mut_gene_scores=pathway_analysis['mut_gene_scores'],
-                cnv_gene_scores=pathway_analysis['cnv_gene_scores'],
-                pathway_gene_lists=pathway_gene_lists,
-                gene_cols=gene_cols,
-                outdir=args.outdir,
-                fold_num=fold,
-                top_k_genes=10
-            )
         # ===== END OF ADDITION =====
-
+        
         # Store test predictions
         all_test_y_true.append(test_metrics['y_true'])
         all_test_y_pred.append(test_metrics['y_pred'])
@@ -1994,45 +1185,23 @@ def main_5fold_cv():
         all_fold_predictions.append(fold_predictions_df)
         
         print(f"\nFold {fold} Complete!")
-        print(f"   Val:  AUC={final_val_metrics['auc']:.4f}, F1={final_val_metrics['f1_binary']:.4f}, Threshold={best_threshold:.4f}")
+        print(f"   Val:  AUC={final_val_metrics['auc']:.4f}, F1={final_val_metrics['f1_binary']:.4f}")
         print(f"   Test: AUC={test_metrics['auc']:.4f}, F1={test_metrics['f1_binary']:.4f}, Acc={test_metrics['acc']:.4f}")
-
+        
         # Clean metrics before storing
-        test_metrics_clean = {k: v for k, v in test_metrics.items()
+        test_metrics_clean = {k: v for k, v in test_metrics.items() 
                              if k not in ['y_true', 'y_pred', 'y_probs']}
-        val_metrics_clean = {k: v for k, v in final_val_metrics.items()
+        val_metrics_clean = {k: v for k, v in final_val_metrics.items() 
                             if k not in ['y_true', 'y_pred', 'y_probs']}
-
+        
         all_fold_val_metrics.append(val_metrics_clean)
         all_fold_test_metrics.append(test_metrics_clean)
         all_fold_details.append({
             'fold': fold,
             'best_epoch': best_epoch,
-            'best_threshold': best_threshold,
             'val_metrics': val_metrics_clean,
             'test_metrics': test_metrics_clean
         })
-
-        # ── Save checkpoint so we can resume if interrupted ──────────────────
-        completed_folds.append(fold)
-        save_progress_checkpoint(
-            args.outdir, completed_folds,
-            all_fold_val_metrics, all_fold_test_metrics, all_fold_details,
-            all_fold_predictions, all_test_y_true, all_test_y_pred, all_test_y_probs
-        )
-        # ─────────────────────────────────────────────────────────────────────
-
-# ── All folds complete: remove checkpoint ───────────────────────────────────
-    checkpoint_path = os.path.join(args.outdir, 'checkpoint_progress.json')
-    if os.path.exists(checkpoint_path):
-        os.remove(checkpoint_path)
-        # Remove per-fold prediction temp files
-        for fn in completed_folds:
-            pred_path = os.path.join(args.outdir, f"checkpoint_fold{fn}_predictions.csv")
-            if os.path.exists(pred_path):
-                os.remove(pred_path)
-        print("[Checkpoint] All folds complete — checkpoint files removed.")
-    # ─────────────────────────────────────────────────────────────────────────
 
 # FINAL RESULTS
     print(f"\n{'='*70}")
@@ -2053,14 +1222,7 @@ def main_5fold_cv():
     for detail in all_fold_details:
         print(f"Fold {detail['fold']}: Val AUC={detail['val_metrics']['auc']:.4f}, "
               f"Test AUC={detail['test_metrics']['auc']:.4f}, "
-              f"Test F1={detail['test_metrics']['f1_binary']:.4f}, "
-              f"Threshold={detail['best_threshold']:.4f}")
-
-    # Display threshold statistics
-    thresholds = [d['best_threshold'] for d in all_fold_details]
-    print(f"\nTHRESHOLD STATISTICS (determined from validation sets):")
-    print(f"  Mean Threshold: {np.mean(thresholds):.4f} ± {np.std(thresholds):.4f}")
-    print(f"  Range: [{np.min(thresholds):.4f}, {np.max(thresholds):.4f}]")
+              f"Test F1={detail['test_metrics']['f1_binary']:.4f}")
 
     # Generate aggregate visualizations
     print(f"\nGenerating aggregate visualizations...")
@@ -2105,28 +1267,6 @@ def main_5fold_cv():
     except Exception as e:
         print(f"Warning: Could not aggregate pathway importance: {str(e)}")
         aggregate_pathway_summary = None
-
-    # Aggregate gene importance across all folds
-    try:
-        print(f"\nAggregating gene importance across folds...")
-        aggregate_gene_summary = aggregate_gene_rankings_across_folds(
-            outdir=args.outdir,
-            n_folds=5
-        )
-    except Exception as e:
-        print(f"Warning: Could not aggregate gene importance: {str(e)}")
-        aggregate_gene_summary = None
-
-    # Aggregate top-genes-per-pathway across all folds
-    try:
-        print(f"\nAggregating pathway-gene importance across folds...")
-        aggregate_pathway_gene_summary = aggregate_pathway_gene_rankings_across_folds(
-            outdir=args.outdir,
-            n_folds=5
-        )
-    except Exception as e:
-        print(f"Warning: Could not aggregate pathway-gene importance: {str(e)}")
-        aggregate_pathway_gene_summary = None
     # ===== END OF ADDITION =====
 
     # Save results
