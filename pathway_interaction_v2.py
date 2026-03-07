@@ -1368,40 +1368,66 @@ def extract_and_save_pathway_interactions(model, loader, pathway_ids, pathway_na
 
 def analyze_and_save_pathway_importance(model, test_loader, pathway_names, device, outdir, fold_num, top_k=10):
     """
-    Analyze pathway importance and save top influential pathways
+    Analyze pathway importance and save top influential pathways.
+    Rankings are based on differential attention (metastatic - primary) to
+    identify pathways that specifically contribute to metastatic progression.
     """
     model.eval()
-    all_pathway_weights = []
+    weights_by_class = {0: [], 1: []}
 
     print(f"\n{'='*70}")
     print(f"PATHWAY IMPORTANCE ANALYSIS - FOLD {fold_num}")
     print(f"{'='*70}")
 
     with torch.no_grad():
-        for mut_b, cnv_b, _ in test_loader:
+        for mut_b, cnv_b, y_b in test_loader:
             mut_b, cnv_b = mut_b.to(device), cnv_b.to(device)
             _, extras = model(mut_b, cnv_b, return_extras=True)
-            all_pathway_weights.append(extras["pathway_weights"].cpu().numpy())
+            pw = extras["pathway_weights"].cpu().numpy()
+            labels = y_b.numpy()
+            for cls in (0, 1):
+                mask = labels == cls
+                if mask.any():
+                    weights_by_class[cls].append(pw[mask])
 
-    mean_pathway_weights = np.mean(np.vstack(all_pathway_weights), axis=0)
-    pathway_ranking = np.argsort(-mean_pathway_weights)
+    meta_weights = np.vstack(weights_by_class[1]) if weights_by_class[1] else None
+    prim_weights = np.vstack(weights_by_class[0]) if weights_by_class[0] else None
 
-    print(f"\nTop {top_k} Most Influential Pathways:")
-    print("-" * 80)
-    print(f"{'Rank':<6} {'Pathway ID':<15} {'Pathway Name':<40} {'Score':<12}")
-    print("-" * 80)
+    if meta_weights is None:
+        print("Warning: No metastatic samples found in loader. Falling back to overall mean.")
+        all_weights = np.vstack(weights_by_class[0])
+        mean_meta = mean_prim = mean_pathway_weights = np.mean(all_weights, axis=0)
+        diff_scores = mean_pathway_weights
+    else:
+        mean_meta = np.mean(meta_weights, axis=0)
+        mean_prim = np.mean(prim_weights, axis=0) if prim_weights is not None else np.zeros_like(mean_meta)
+        # Differential score: how much more active each pathway is in metastatic vs primary
+        diff_scores = mean_meta - mean_prim
+        mean_pathway_weights = mean_meta  # kept for backwards-compat in return value
+
+    pathway_ranking = np.argsort(-diff_scores)
+
+    print(f"\nTop {top_k} Pathways Contributing to Metastatic Progression")
+    print(f"  (ranked by differential attention: metastatic - primary)")
+    print("-" * 95)
+    print(f"{'Rank':<6} {'Pathway Name':<45} {'Meta Score':<14} {'Prim Score':<14} {'Differential':<12}")
+    print("-" * 95)
 
     pathway_results = []
     for rank, idx in enumerate(pathway_ranking[:top_k], 1):
         pathway_name = pathway_names[idx] if idx < len(pathway_names) else f"Pathway_{idx}"
-        score = mean_pathway_weights[idx]
-        display_name = pathway_name[:38] + "..." if len(pathway_name) > 40 else pathway_name
-        print(f"{rank:<6} {idx:<15} {display_name:<40} {score:.8f}")
+        display_name = pathway_name[:43] + ".." if len(pathway_name) > 45 else pathway_name
+        m_score = float(mean_meta[idx])
+        p_score = float(mean_prim[idx])
+        d_score = float(diff_scores[idx])
+        print(f"{rank:<6} {display_name:<45} {m_score:<14.8f} {p_score:<14.8f} {d_score:<12.8f}")
         pathway_results.append({
             'rank': rank,
             'pathway_idx': int(idx),
             'pathway_name': pathway_name,
-            'importance_score': float(score)
+            'metastatic_score': m_score,
+            'primary_score': p_score,
+            'differential_score': d_score,
         })
 
     # Save complete rankings to CSV
@@ -1413,7 +1439,9 @@ def analyze_and_save_pathway_importance(model, test_loader, pathway_names, devic
             'rank': rank,
             'pathway_idx': int(idx),
             'pathway_name': pathway_name,
-            'importance_score': float(mean_pathway_weights[idx])
+            'metastatic_score': float(mean_meta[idx]),
+            'primary_score': float(mean_prim[idx]),
+            'differential_score': float(diff_scores[idx]),
         })
 
     csv_file = os.path.join(outdir, f"pathway_importance_fold{fold_num}.csv")
@@ -1468,30 +1496,33 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
 
     pathway_stats = combined_df.groupby('pathway_idx').agg({
         'pathway_name': 'first',
-        'importance_score': ['mean', 'std', 'min', 'max'],
+        'differential_score': ['mean', 'std', 'min', 'max'],
+        'metastatic_score': 'mean',
+        'primary_score': 'mean',
         'rank': ['mean', 'std', 'min', 'max']
     }).reset_index()
 
     pathway_stats.columns = [
         'pathway_idx', 'pathway_name',
-        'mean_importance', 'std_importance', 'min_importance', 'max_importance',
+        'mean_differential', 'std_differential', 'min_differential', 'max_differential',
+        'mean_metastatic', 'mean_primary',
         'mean_rank', 'std_rank', 'min_rank', 'max_rank'
     ]
 
-    pathway_stats = pathway_stats.sort_values('mean_importance', ascending=False).reset_index(drop=True)
+    pathway_stats = pathway_stats.sort_values('mean_differential', ascending=False).reset_index(drop=True)
     pathway_stats['overall_rank'] = range(1, len(pathway_stats) + 1)
 
-    print(f"\nTop 20 Most Consistently Important Pathways (Across {n_folds} Folds):")
-    print("-" * 100)
-    print(f"{'Rank':<6} {'Pathway':<15} {'Name':<35} {'Mean Importance':<18} {'Mean Rank':<12}")
-    print("-" * 100)
+    print(f"\nTop 20 Pathways Contributing to Metastatic Progression (Across {n_folds} Folds):")
+    print(f"  (ranked by mean differential attention: metastatic - primary)")
+    print("-" * 105)
+    print(f"{'Rank':<6} {'Name':<40} {'Mean Differential':<20} {'Meta Score':<14} {'Prim Score':<12}")
+    print("-" * 105)
 
     for _, row in pathway_stats.head(20).iterrows():
-        display_name = row['pathway_name'][:33] + "..." if len(row['pathway_name']) > 35 else row['pathway_name']
-        importance_str = f"{row['mean_importance']:.6f} ± {row['std_importance']:.6f}"
-        rank_str = f"{row['mean_rank']:.1f} ± {row['std_rank']:.1f}"
-        print(f"{int(row['overall_rank']):<6} {int(row['pathway_idx']):<15} {display_name:<35} "
-              f"{importance_str:<18} {rank_str:<12}")
+        display_name = row['pathway_name'][:38] + ".." if len(row['pathway_name']) > 40 else row['pathway_name']
+        diff_str = f"{row['mean_differential']:.6f} ± {row['std_differential']:.6f}"
+        print(f"{int(row['overall_rank']):<6} {display_name:<40} {diff_str:<20} "
+              f"{row['mean_metastatic']:<14.6f} {row['mean_primary']:<12.6f}")
 
     aggregate_csv = os.path.join(pathway_dir, "aggregate_pathway_importance.csv")
     pathway_stats.to_csv(aggregate_csv, index=False)
@@ -1503,8 +1534,10 @@ def aggregate_pathway_rankings_across_folds(outdir, n_folds=5):
             'overall_rank': int(row['overall_rank']),
             'pathway_idx': int(row['pathway_idx']),
             'pathway_name': row['pathway_name'],
-            'mean_importance': float(row['mean_importance']),
-            'std_importance': float(row['std_importance']),
+            'mean_differential': float(row['mean_differential']),
+            'std_differential': float(row['std_differential']),
+            'mean_metastatic': float(row['mean_metastatic']),
+            'mean_primary': float(row['mean_primary']),
             'mean_rank': float(row['mean_rank']),
             'std_rank': float(row['std_rank'])
         })
