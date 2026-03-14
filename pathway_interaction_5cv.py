@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import accuracy_score, roc_auc_score, average_precision_score, f1_score, precision_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from datetime import datetime
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import precision_recall_curve
@@ -1425,14 +1425,15 @@ def analyze_and_save_pathway_importance(model, test_loader, pathway_names, devic
         'mean_scores': mean_pathway_weights
     }
 # ===============================
-# MAIN FUNCTION - Single Split (70/10/20)
+# MAIN FUNCTION - 5-Fold Stratified Cross-Validation
 # ===============================
 
-def main_train_val_test():
-    """Main function for a single stratified split: 70% train / 10% val / 20% test."""
+def main_5fold_cv():
+    """Main function for 5-fold stratified cross-validation."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data")
-    ap.add_argument("--outdir", default="outputs_split_70_10_20")
+    ap.add_argument("--outdir", default="outputs_5fold_cv")
+    ap.add_argument("--n_folds", type=int, default=5, help="Number of CV folds")
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -1448,7 +1449,7 @@ def main_train_val_test():
     ap.add_argument("--use_batch_norm", action='store_true', default=True)
     ap.add_argument("--pe_dim", type=int, default=16)
     ap.add_argument("--use_edge_aware_blocks", action='store_true', default=True)
-    ap.add_argument("--use_full_graph", action='store_true', 
+    ap.add_argument("--use_full_graph", action='store_true',
                     help="Use fully connected graph (all pathways attend to all) instead of sparse adjacency")
     ap.add_argument("--crosstalk_top_k", type=int, default=20,
                     help="Number of pathways for Primary vs Metastatic crosstalk comparison")
@@ -1459,300 +1460,326 @@ def main_train_val_test():
     ap.add_argument("--no_normalize_interactions", dest="normalize_interactions", action="store_false",
                     help="Disable min-max normalization for pathway interaction matrices")
     ap.set_defaults(normalize_interactions=True)
-    
+
     args = ap.parse_args()
 
     print(f"\n{'='*70}")
-    print("SINGLE STRATIFIED TRAIN/VAL/TEST SPLIT")
+    print(f"{args.n_folds}-FOLD STRATIFIED CROSS-VALIDATION")
     print(f"{'='*70}")
     print(f"Model: Improved Graph Transformer (Dwivedi & Bresson)")
-    print("Split Strategy: 70% train, 10% validation, 20% test")
+    print(f"Split Strategy: {args.n_folds}-fold CV (each fold: ~{100//args.n_folds}% test, "
+          f"~{100 - 100//args.n_folds}% train+val)")
     print(f"{'='*70}\n")
-    
+
     os.makedirs(args.outdir, exist_ok=True)
 
-    # Load data
-    # mut_df, cnv_df, labels, pathway_gene_lists, pathway_ids, pathway_names, A, gene_cols = load_tables(args.data_dir)
     mut_df, cnv_df, labels, pathway_gene_lists, pathway_ids, pathway_names, A, gene_cols = load_tables(
-    args.data_dir, use_full_graph=args.use_full_graph
-)
+        args.data_dir, use_full_graph=args.use_full_graph
+    )
     print(f"Data: {len(mut_df)} patients | {len(gene_cols)} genes | {len(pathway_ids)} pathways")
 
     pathway_interaction_dir = os.path.join(args.outdir, "pathway_interactions")
     os.makedirs(pathway_interaction_dir, exist_ok=True)
 
     y_arr = binarize_labels(labels).values.astype(np.int64)
-    
+
     unique, counts = np.unique(y_arr, return_counts=True)
     print(f"\nClass Distribution:")
     for label, count in zip(unique, counts):
         print(f"  Label {label}: {count} patients ({count/len(y_arr)*100:.1f}%)")
 
-    split_path = os.path.join(args.outdir, f"split_70_10_20_rs{args.random_state}.json")
-    split_data = load_train_val_test_split(split_path)
-    if split_data is None:
-        print("\nCreating new stratified 70/10/20 split...")
-        split_data = create_train_val_test_split(
-            y_arr,
-            random_state=args.random_state,
-            save_path=split_path
-        )
-    else:
-        print("\nUsing existing saved split for reproducibility.")
-
-    train_idx = np.array(split_data['train_idx'])
-    val_idx = np.array(split_data['val_idx'])
-    test_idx = np.array(split_data['test_idx'])
-
-    set_seed(args.random_state)
-
-    mut_tr, mut_va, mut_te, cnv_tr, cnv_va, cnv_te, y_tr, y_va, y_te, _, _, _ = prepare_data_from_splits(
-        mut_df, cnv_df, labels, train_idx, val_idx, test_idx
-    )
-
-    train_ds = GenePatientDataset(mut_tr, cnv_tr, y_tr)
-    val_ds = GenePatientDataset(mut_va, cnv_va, y_va)
-    test_ds = GenePatientDataset(mut_te, cnv_te, y_te)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=args.batch, shuffle=False, num_workers=0)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     max_M = max(len(lst) for lst in pathway_gene_lists)
+    graph_suffix = "fullgraph" if args.use_full_graph else "sparse"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    model = PathwayGraphTransformer(
-        num_genes=len(gene_cols),
-        num_pathways=len(pathway_ids),
-        max_pathway_genes=max_M,
-        d=args.d_model,
-        layers=args.layers,
-        num_heads=args.num_heads,
-        dropout=args.dropout,
-        use_film=True,
-        use_edge_mask=not args.use_full_graph,
-        use_edge_bias=True,
-        pe_dim=args.pe_dim,
-        use_batch_norm=args.use_batch_norm,
-        use_edge_aware_blocks=args.use_edge_aware_blocks,
-        full_graph_attention=args.use_full_graph
-    ).to(device)
-    model.set_structures(pathway_gene_lists, torch.from_numpy(A))
+    skf = StratifiedKFold(n_splits=args.n_folds, shuffle=True, random_state=args.random_state)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    classes = np.unique(y_tr.numpy())
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_tr.numpy())
-    weights = torch.tensor(weights, dtype=torch.float32).to(device)
-    criterion = FocalLoss(alpha=weights, gamma=2.0) if args.use_focal_loss else nn.CrossEntropyLoss(weight=weights)
-
-    best_val_metric = -float("inf")
-    epochs_no_improve = 0
-    best_epoch = 0
-    best_model_state = None
-
-    print("\nTraining single split model...")
-    for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, train_loader, opt, criterion, device)
-        val_metrics = evaluate_metrics(model, val_loader, device)
-        val_metric = val_metrics["auc"]
-
-        if val_metric > best_val_metric:
-            best_val_metric = val_metric
-            epochs_no_improve = 0
-            best_epoch = epoch
-            best_model_state = copy.deepcopy(model.state_dict())
-        else:
-            epochs_no_improve += 1
-
-        if epoch % 10 == 0 or epoch <= 5:
-            print(f"Epoch {epoch:3d} | Loss: {tr_loss:.4f} | Val AUC: {val_metric:.4f} | "
-                  f"Patience: {epochs_no_improve}/{args.patience}")
-
-        if epoch >= args.min_epochs and epochs_no_improve >= args.patience:
-            print(f"\nEarly stopping at epoch {epoch}")
-            break
-
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-
-    final_val_metrics = evaluate_metrics(model, val_loader, device)
-    test_metrics = evaluate_metrics(model, test_loader, device)
+    # Accumulators across folds
+    all_fold_results = []
+    all_test_y_true = []
+    all_test_y_pred = []
+    all_test_y_probs = []
+    fold_attn_matrices = []          # aggregate attention per fold
+    fold_primary_matrices = []       # class-0 attention per fold
+    fold_metastatic_matrices = []    # class-1 attention per fold
+    fold_edge_stats_list = []
 
     pathway_importance_dir = os.path.join(args.outdir, "pathway_importance")
     os.makedirs(pathway_importance_dir, exist_ok=True)
-    pathway_analysis = analyze_and_save_pathway_importance(
-        model=model,
-        test_loader=test_loader,
-        pathway_names=pathway_names,
-        device=device,
-        outdir=pathway_importance_dir,
-        fold_num=1,
-        top_k=10
-    )
 
-    fold_attn = extract_and_save_pathway_interactions(
-        model=model,
-        loader=test_loader,
-        pathway_ids=pathway_ids,
-        pathway_names=pathway_names,
-        device=device,
-        outdir=pathway_interaction_dir,
-        fold_num=1,
-        normalize=args.normalize_interactions
-    )
+    all_indices = np.arange(len(y_arr))
 
-    class_mats, class_counts = extract_pathway_attention_by_class(model, test_loader, device)
-    split_primary = class_mats.get(0)
-    split_metastatic = class_mats.get(1)
-    split_primary_vis = split_primary
-    split_metastatic_vis = split_metastatic
-    if args.normalize_interactions and split_primary is not None and split_metastatic is not None:
-        split_primary_vis, split_metastatic_vis, shared_min, shared_max = normalize_primary_metastatic_pair(
-            split_primary, split_metastatic
+    for fold_num, (train_val_idx, test_idx) in enumerate(skf.split(all_indices, y_arr), 1):
+        print(f"\n{'='*70}")
+        print(f"FOLD {fold_num}/{args.n_folds}")
+        print(f"{'='*70}")
+        print(f"  Train+Val: {len(train_val_idx)} | Test: {len(test_idx)}")
+
+        # Carve a validation set (~10% of total) from the training portion
+        y_train_val = y_arr[train_val_idx]
+        # Val = 10% of the 4 training folds; train = remaining 90%
+        train_idx, val_idx = train_test_split(
+            train_val_idx,
+            test_size=0.10,
+            stratify=y_train_val,
+            random_state=args.random_state + fold_num
         )
-        print(f"Normalized class-specific matrices to [0,1] with shared scale "
-              f"(raw min={shared_min:.6g}, raw max={shared_max:.6g})")
+        print(f"  Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
 
-    split_attn_samples, split_labels = extract_pathway_attention_samples(model, test_loader, device)
-    split_edge_stats = None
-    if split_attn_samples is not None and split_labels is not None:
-        primary_samples = split_attn_samples[split_labels == 0]
-        metastatic_samples = split_attn_samples[split_labels == 1]
-        if len(primary_samples) > 1 and len(metastatic_samples) > 1:
-            split_edge_stats = compute_and_save_edge_fdr(
-                primary_samples=primary_samples,
-                metastatic_samples=metastatic_samples,
+        set_seed(args.random_state + fold_num)
+
+        mut_tr, mut_va, mut_te, cnv_tr, cnv_va, cnv_te, y_tr, y_va, y_te, _, _, _ = prepare_data_from_splits(
+            mut_df, cnv_df, labels, train_idx, val_idx, test_idx
+        )
+
+        train_ds = GenePatientDataset(mut_tr, cnv_tr, y_tr)
+        val_ds   = GenePatientDataset(mut_va, cnv_va, y_va)
+        test_ds  = GenePatientDataset(mut_te, cnv_te, y_te)
+
+        train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,  num_workers=0)
+        val_loader   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False, num_workers=0)
+        test_loader  = DataLoader(test_ds,  batch_size=args.batch, shuffle=False, num_workers=0)
+
+        model = PathwayGraphTransformer(
+            num_genes=len(gene_cols),
+            num_pathways=len(pathway_ids),
+            max_pathway_genes=max_M,
+            d=args.d_model,
+            layers=args.layers,
+            num_heads=args.num_heads,
+            dropout=args.dropout,
+            use_film=True,
+            use_edge_mask=not args.use_full_graph,
+            use_edge_bias=True,
+            pe_dim=args.pe_dim,
+            use_batch_norm=args.use_batch_norm,
+            use_edge_aware_blocks=args.use_edge_aware_blocks,
+            full_graph_attention=args.use_full_graph
+        ).to(device)
+        model.set_structures(pathway_gene_lists, torch.from_numpy(A))
+
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        classes = np.unique(y_tr.numpy())
+        weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_tr.numpy())
+        weights = torch.tensor(weights, dtype=torch.float32).to(device)
+        criterion = FocalLoss(alpha=weights, gamma=2.0) if args.use_focal_loss else nn.CrossEntropyLoss(weight=weights)
+
+        best_val_metric = -float("inf")
+        epochs_no_improve = 0
+        best_epoch = 0
+        best_model_state = None
+
+        print(f"\nTraining fold {fold_num}...")
+        for epoch in range(1, args.epochs + 1):
+            tr_loss = train_one_epoch(model, train_loader, opt, criterion, device)
+            val_metrics = evaluate_metrics(model, val_loader, device)
+            val_metric = val_metrics["auc"]
+
+            if val_metric > best_val_metric:
+                best_val_metric = val_metric
+                epochs_no_improve = 0
+                best_epoch = epoch
+                best_model_state = copy.deepcopy(model.state_dict())
+            else:
+                epochs_no_improve += 1
+
+            if epoch % 10 == 0 or epoch <= 5:
+                print(f"  Epoch {epoch:3d} | Loss: {tr_loss:.4f} | Val AUC: {val_metric:.4f} | "
+                      f"Patience: {epochs_no_improve}/{args.patience}")
+
+            if epoch >= args.min_epochs and epochs_no_improve >= args.patience:
+                print(f"\n  Early stopping at epoch {epoch}")
+                break
+
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+
+        final_val_metrics = evaluate_metrics(model, val_loader, device)
+        test_metrics      = evaluate_metrics(model, test_loader, device)
+
+        print(f"\n  Fold {fold_num} Results:")
+        print(f"    Val:  AUC={final_val_metrics['auc']:.4f}, F1={final_val_metrics['f1_binary']:.4f}, "
+              f"Acc={final_val_metrics['acc']:.4f}")
+        print(f"    Test: AUC={test_metrics['auc']:.4f}, F1={test_metrics['f1_binary']:.4f}, "
+              f"Acc={test_metrics['acc']:.4f}")
+
+        all_test_y_true.append(test_metrics['y_true'])
+        all_test_y_pred.append(test_metrics['y_pred'])
+        all_test_y_probs.append(test_metrics['y_probs'])
+
+        # --- Pathway importance for this fold ---
+        pathway_analysis = analyze_and_save_pathway_importance(
+            model=model,
+            test_loader=test_loader,
+            pathway_names=pathway_names,
+            device=device,
+            outdir=pathway_importance_dir,
+            fold_num=fold_num,
+            top_k=10
+        )
+
+        # --- Pathway attention matrices for this fold ---
+        fold_attn = extract_and_save_pathway_interactions(
+            model=model,
+            loader=test_loader,
+            pathway_ids=pathway_ids,
+            pathway_names=pathway_names,
+            device=device,
+            outdir=pathway_interaction_dir,
+            fold_num=fold_num,
+            normalize=args.normalize_interactions
+        )
+        if fold_attn is not None:
+            fold_attn_matrices.append(fold_attn)
+
+        # --- Class-specific attention for this fold ---
+        class_mats, class_counts = extract_pathway_attention_by_class(model, test_loader, device)
+        fold_primary    = class_mats.get(0)
+        fold_metastatic = class_mats.get(1)
+
+        if args.normalize_interactions and fold_primary is not None and fold_metastatic is not None:
+            fold_primary_vis, fold_metastatic_vis, shared_min, shared_max = normalize_primary_metastatic_pair(
+                fold_primary, fold_metastatic
+            )
+            print(f"  Fold {fold_num}: Normalized class matrices "
+                  f"(raw min={shared_min:.6g}, raw max={shared_max:.6g})")
+        else:
+            fold_primary_vis    = fold_primary
+            fold_metastatic_vis = fold_metastatic
+
+        if fold_primary_vis is not None:
+            fold_primary_matrices.append(fold_primary_vis)
+        if fold_metastatic_vis is not None:
+            fold_metastatic_matrices.append(fold_metastatic_vis)
+
+        # --- Per-fold crosstalk ---
+        fold_attn_samples, fold_sample_labels = extract_pathway_attention_samples(model, test_loader, device)
+        fold_edge_stats = None
+        if fold_attn_samples is not None and fold_sample_labels is not None:
+            primary_samples    = fold_attn_samples[fold_sample_labels == 0]
+            metastatic_samples = fold_attn_samples[fold_sample_labels == 1]
+            if len(primary_samples) > 1 and len(metastatic_samples) > 1:
+                fold_edge_stats = compute_and_save_edge_fdr(
+                    primary_samples=primary_samples,
+                    metastatic_samples=metastatic_samples,
+                    pathway_ids=pathway_ids,
+                    pathway_names=pathway_names,
+                    outdir=pathway_interaction_dir,
+                    prefix=f"fold{fold_num}",
+                    alpha=args.fdr_alpha
+                )
+            else:
+                print(f"  Warning: Not enough per-class samples in fold {fold_num} for edge FDR.")
+        fold_edge_stats_list.append(fold_edge_stats)
+
+        if fold_primary_vis is not None and fold_metastatic_vis is not None:
+            create_full_crosstalk_outputs(
+                primary_mat=fold_primary_vis,
+                metastatic_mat=fold_metastatic_vis,
                 pathway_ids=pathway_ids,
                 pathway_names=pathway_names,
                 outdir=pathway_interaction_dir,
-                prefix="split",
-                alpha=args.fdr_alpha
+                prefix=f"fold{fold_num}"
             )
-        else:
-            print("Warning: Not enough samples per class for per-edge FDR testing (need >=2 per class).")
+            top_k_fold = min(args.crosstalk_top_k, len(pathway_ids))
+            fold_change_rank, fold_change_scores = rank_pathways_by_interaction_change(
+                fold_primary_vis, fold_metastatic_vis
+            )
+            create_topk_crosstalk_outputs(
+                primary_mat=fold_primary_vis,
+                metastatic_mat=fold_metastatic_vis,
+                selected_indices=fold_change_rank[:top_k_fold],
+                pathway_ids=pathway_ids,
+                pathway_names=pathway_names,
+                outdir=pathway_interaction_dir,
+                prefix=f"fold{fold_num}"
+            )
 
-    if split_primary_vis is not None and split_metastatic_vis is not None:
-        create_full_crosstalk_outputs(
-            primary_mat=split_primary_vis,
-            metastatic_mat=split_metastatic_vis,
-            pathway_ids=pathway_ids,
-            pathway_names=pathway_names,
-            outdir=pathway_interaction_dir,
-            prefix="split"
-        )
-        top_k_split = min(args.crosstalk_top_k, len(pathway_ids))
-        split_change_rank, split_change_scores = rank_pathways_by_interaction_change(
-            split_primary_vis,
-            split_metastatic_vis
-        )
-        split_top_idx = split_change_rank[:top_k_split]
-        split_change_df = pd.DataFrame({
-            'rank': np.arange(1, len(pathway_ids) + 1),
-            'pathway_idx': split_change_rank.astype(int),
-            'pathway_id': [pathway_ids[i] for i in split_change_rank],
-            'pathway_name': [pathway_names[i] for i in split_change_rank],
-            'interaction_change_score': [float(split_change_scores[i]) for i in split_change_rank]
+        all_fold_results.append({
+            'fold': fold_num,
+            'best_epoch': best_epoch,
+            'val_metrics':  {k: final_val_metrics[k] for k in ['auc', 'f1_binary', 'acc', 'precision', 'recall']},
+            'test_metrics': {k: test_metrics[k]       for k in ['auc', 'f1_binary', 'acc', 'precision', 'recall']},
         })
-        split_change_csv = os.path.join(pathway_interaction_dir, "split_pathway_change_ranking.csv")
-        split_change_df.to_csv(split_change_csv, index=False)
-        print(f"Pathways ranked by Primary-Metastatic interaction change saved to: {split_change_csv}")
-        create_topk_crosstalk_outputs(
-            primary_mat=split_primary_vis,
-            metastatic_mat=split_metastatic_vis,
-            selected_indices=split_top_idx,
-            pathway_ids=pathway_ids,
-            pathway_names=pathway_names,
-            outdir=pathway_interaction_dir,
-            prefix="split"
-        )
-        print(f"Split class counts for crosstalk: Primary={class_counts[0]}, Metastatic={class_counts[1]}")
-    else:
-        print("Warning: Missing class-specific attention matrix; Primary vs Metastatic crosstalk not saved.")
 
-    all_test_y_true = [test_metrics['y_true']]
-    all_test_y_pred = [test_metrics['y_pred']]
-    all_test_y_probs = [test_metrics['y_probs']]
-
+    # ============================================================
+    # Aggregate results across all folds
+    # ============================================================
     print(f"\n{'='*70}")
-    print("SINGLE SPLIT TRAINING COMPLETE!")
+    print(f"{args.n_folds}-FOLD CROSS-VALIDATION COMPLETE")
     print(f"{'='*70}")
-    print(f"Best epoch: {best_epoch}")
-    print(f"Validation: AUC={final_val_metrics['auc']:.4f}, F1={final_val_metrics['f1_binary']:.4f}, "
-          f"Acc={final_val_metrics['acc']:.4f}")
-    print(f"Test:       AUC={test_metrics['auc']:.4f}, F1={test_metrics['f1_binary']:.4f}, "
-          f"Acc={test_metrics['acc']:.4f}")
 
-    print(f"\nGenerating visualizations...")
+    metric_keys = ['auc', 'f1_binary', 'acc', 'precision', 'recall']
+    print(f"\n{'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
+    print("-" * 60)
+    summary_metrics = {}
+    for key in metric_keys:
+        vals = [r['test_metrics'][key] for r in all_fold_results]
+        mean_v, std_v = float(np.mean(vals)), float(np.std(vals))
+        summary_metrics[key] = {'mean': mean_v, 'std': std_v, 'min': float(np.min(vals)), 'max': float(np.max(vals))}
+        print(f"  {key:<13} {mean_v:>10.4f} {std_v:>10.4f} {np.min(vals):>10.4f} {np.max(vals):>10.4f}")
+
+    # Aggregate visualizations
     viz_dir = os.path.join(args.outdir, "visualizations")
     os.makedirs(viz_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    graph_suffix = "fullgraph" if args.use_full_graph else "sparse"
-    
+
     plot_aggregate_confusion_matrix(
-        all_test_y_true, all_test_y_pred, 
-        os.path.join(viz_dir, f"split_confusion_matrix_{graph_suffix}_{timestamp}.png"),
-        1, title=f"Confusion Matrix - Test Set ({graph_suffix.upper()})"
+        all_test_y_true, all_test_y_pred,
+        os.path.join(viz_dir, f"cv_confusion_matrix_{graph_suffix}_{timestamp}.png"),
+        args.n_folds, title=f"{args.n_folds}-Fold CV Confusion Matrix ({graph_suffix.upper()})"
     )
-    
     plot_aggregate_roc_curve(
         all_test_y_true, all_test_y_probs,
-        os.path.join(viz_dir, f"split_roc_curve_{graph_suffix}_{timestamp}.png"),
-        1, title=f"ROC Curve - Test Set ({graph_suffix.upper()})"
+        os.path.join(viz_dir, f"cv_roc_curve_{graph_suffix}_{timestamp}.png"),
+        args.n_folds, title=f"{args.n_folds}-Fold CV ROC Curve ({graph_suffix.upper()})"
     )
-    
     plot_aggregate_pr_curve(
         all_test_y_true, all_test_y_probs,
-        os.path.join(viz_dir, f"split_pr_curve_{graph_suffix}_{timestamp}.png"),
-        1, title=f"Precision-Recall Curve - Test Set ({graph_suffix.upper()})"
+        os.path.join(viz_dir, f"cv_pr_curve_{graph_suffix}_{timestamp}.png"),
+        args.n_folds, title=f"{args.n_folds}-Fold CV Precision-Recall Curve ({graph_suffix.upper()})"
     )
 
-    # Aggregate pathway importance over available run(s) - here n_folds=1
+    # Aggregate pathway importance across folds
     try:
-        print(f"\nAggregating pathway importance...")
+        print(f"\nAggregating pathway importance across {args.n_folds} folds...")
         aggregate_pathway_summary = aggregate_pathway_rankings_across_folds(
             outdir=args.outdir,
-            n_folds=1
+            n_folds=args.n_folds
         )
     except Exception as e:
         print(f"Warning: Could not aggregate pathway importance: {str(e)}")
         aggregate_pathway_summary = None
 
-    if fold_attn is not None:
-        aggregate_attention = fold_attn
+    # Aggregate attention matrices (mean across folds)
+    if fold_attn_matrices:
+        aggregate_attention = np.mean(fold_attn_matrices, axis=0)
         aggregate_csv = os.path.join(pathway_interaction_dir, "pathway_attention_aggregate.csv")
         save_pathway_matrix_csv(aggregate_attention, pathway_ids, pathway_names, aggregate_csv)
-        print(f"Aggregate pathway attention matrix saved to: {aggregate_csv}")
+        print(f"Aggregate pathway attention matrix (mean over {len(fold_attn_matrices)} folds) saved to: {aggregate_csv}")
     else:
-        print("Warning: No attention matrix collected; aggregate pathway interaction not saved.")
+        print("Warning: No per-fold attention matrices collected; aggregate not saved.")
 
-    if split_primary_vis is not None and split_metastatic_vis is not None:
-        agg_primary = split_primary_vis
-        agg_metastatic = split_metastatic_vis
+    # Aggregate class-specific matrices (mean across folds)
+    if fold_primary_matrices and fold_metastatic_matrices:
+        agg_primary    = np.mean(fold_primary_matrices,    axis=0)
+        agg_metastatic = np.mean(fold_metastatic_matrices, axis=0)
 
         save_pathway_matrix_csv(
-            agg_primary,
-            pathway_ids,
-            pathway_names,
+            agg_primary, pathway_ids, pathway_names,
             os.path.join(pathway_interaction_dir, "pathway_attention_aggregate_primary.csv")
         )
         save_pathway_matrix_csv(
-            agg_metastatic,
-            pathway_ids,
-            pathway_names,
+            agg_metastatic, pathway_ids, pathway_names,
             os.path.join(pathway_interaction_dir, "pathway_attention_aggregate_metastatic.csv")
         )
 
-        agg_change_rank, agg_change_scores = rank_pathways_by_interaction_change(
-            agg_primary,
-            agg_metastatic
-        )
+        agg_change_rank, agg_change_scores = rank_pathways_by_interaction_change(agg_primary, agg_metastatic)
         top_k_agg = min(args.crosstalk_top_k, len(pathway_ids))
-        top_indices = agg_change_rank[:top_k_agg]
         agg_change_df = pd.DataFrame({
             'rank': np.arange(1, len(pathway_ids) + 1),
             'pathway_idx': agg_change_rank.astype(int),
-            'pathway_id': [pathway_ids[i] for i in agg_change_rank],
+            'pathway_id':   [pathway_ids[i]   for i in agg_change_rank],
             'pathway_name': [pathway_names[i] for i in agg_change_rank],
             'interaction_change_score': [float(agg_change_scores[i]) for i in agg_change_rank]
         })
@@ -1761,46 +1788,40 @@ def main_train_val_test():
         print(f"Aggregate pathway change ranking saved to: {agg_change_csv}")
 
         create_full_crosstalk_outputs(
-            primary_mat=agg_primary,
-            metastatic_mat=agg_metastatic,
-            pathway_ids=pathway_ids,
-            pathway_names=pathway_names,
-            outdir=pathway_interaction_dir,
-            prefix="aggregate"
+            primary_mat=agg_primary, metastatic_mat=agg_metastatic,
+            pathway_ids=pathway_ids, pathway_names=pathway_names,
+            outdir=pathway_interaction_dir, prefix="aggregate"
         )
         create_topk_crosstalk_outputs(
-            primary_mat=agg_primary,
-            metastatic_mat=agg_metastatic,
-            selected_indices=top_indices,
-            pathway_ids=pathway_ids,
-            pathway_names=pathway_names,
-            outdir=pathway_interaction_dir,
-            prefix="aggregate"
+            primary_mat=agg_primary, metastatic_mat=agg_metastatic,
+            selected_indices=agg_change_rank[:top_k_agg],
+            pathway_ids=pathway_ids, pathway_names=pathway_names,
+            outdir=pathway_interaction_dir, prefix="aggregate"
         )
     else:
-        print("Warning: No class-specific attention collected; aggregate Primary vs Metastatic crosstalk not saved.")
+        print("Warning: No class-specific matrices collected; aggregate Primary vs Metastatic crosstalk not saved.")
 
-    results_file = os.path.join(args.outdir, f"split_results_{graph_suffix}_{timestamp}.json")
+    # Save overall CV results
+    results_file = os.path.join(args.outdir, f"cv_results_{graph_suffix}_{timestamp}.json")
     results_data = {
         'timestamp': timestamp,
-        'model_type': 'SingleSplit_Graph_Transformer',
+        'model_type': f'{args.n_folds}FoldCV_Graph_Transformer',
         'graph_mode': 'full_graph' if args.use_full_graph else 'sparse_graph',
-        'split_strategy': 'Stratified 70/10/20',
-        'best_epoch': best_epoch,
-        'validation_metrics': {k: final_val_metrics[k] for k in ['auc', 'f1_binary', 'acc', 'precision', 'recall']},
-        'test_metrics': {k: test_metrics[k] for k in ['auc', 'f1_binary', 'acc', 'precision', 'recall']},
+        'n_folds': args.n_folds,
+        'per_fold_results': all_fold_results,
+        'summary_test_metrics': summary_metrics,
         'config': vars(args),
-        'edge_fdr_stats': split_edge_stats
     }
-    
     with open(results_file, 'w') as f:
         json.dump(results_data, f, indent=2, default=str)
-    print(f"\nResults saved to: {results_file}")
-    
+    print(f"\nFull CV results saved to: {results_file}")
+
     return results_data
 
 if __name__ == "__main__":
-    results = main_train_val_test()
-    print(f"\nSingle-split experiment complete.")
-    print(f"   Test AUC: {results['test_metrics']['auc']:.4f}")
-    print(f"   Test F1:  {results['test_metrics']['f1_binary']:.4f}")
+    results = main_5fold_cv()
+    print(f"\n{results['n_folds']}-fold CV experiment complete.")
+    sm = results['summary_test_metrics']
+    print(f"   Test AUC:  {sm['auc']['mean']:.4f} ± {sm['auc']['std']:.4f}")
+    print(f"   Test F1:   {sm['f1_binary']['mean']:.4f} ± {sm['f1_binary']['std']:.4f}")
+    print(f"   Test Acc:  {sm['acc']['mean']:.4f} ± {sm['acc']['std']:.4f}")
