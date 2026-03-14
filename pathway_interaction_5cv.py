@@ -1518,10 +1518,10 @@ def main_5fold_cv():
 
         # Carve a validation set (~10% of total) from the training portion
         y_train_val = y_arr[train_val_idx]
-        val_frac = 0.125  # 10% of total ≈ 12.5% of the 80% train+val
+        # Val = 10% of the 4 training folds; train = remaining 90%
         train_idx, val_idx = train_test_split(
             train_val_idx,
-            test_size=val_frac,
+            test_size=0.10,
             stratify=y_train_val,
             random_state=args.random_state + fold_num
         )
