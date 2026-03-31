@@ -1,0 +1,98 @@
+ABLATION STUDY RUN COMMANDS
+============================
+
+All scripts accept the same arguments as main.py.
+Adjust --data_dir to point to your data folder.
+
+------------------------------------------------------------
+BASELINE (original model)
+------------------------------------------------------------
+python main.py \
+    --data_dir data \
+    --outdir outputs_baseline \
+    --epochs 200 \
+    --batch 16 \
+    --lr 1e-4 \
+    --d_model 64 \
+    --layers 2 \
+    --num_heads 4 \
+    --dropout 0.2
+
+------------------------------------------------------------
+ABLATION 1: No Graph Transformer
+(skips transformer layers; feeds Z+PE directly to readout)
+------------------------------------------------------------
+python ablation1_no_graph_transformer.py \
+    --data_dir data \
+    --outdir outputs_ablation1_no_graph_transformer \
+    --epochs 200 \
+    --batch 16 \
+    --lr 1e-4 \
+    --d_model 64 \
+    --layers 2 \
+    --num_heads 4 \
+    --dropout 0.2
+
+------------------------------------------------------------
+ABLATION 2: Hard Mask (float('-inf') instead of -10.0)
+(disables soft-mask / new-edge discovery mechanism)
+------------------------------------------------------------
+python ablation2_hard_mask.py \
+    --data_dir data \
+    --outdir outputs_ablation2_hard_mask \
+    --epochs 200 \
+    --batch 16 \
+    --lr 1e-4 \
+    --d_model 64 \
+    --layers 2 \
+    --num_heads 4 \
+    --dropout 0.2
+
+------------------------------------------------------------
+ABLATION 3: No Edge Features (edge_feat=None)
+(removes edge-conditioned attention bias)
+------------------------------------------------------------
+python ablation3_no_edge_features.py \
+    --data_dir data \
+    --outdir outputs_ablation3_no_edge_features \
+    --epochs 200 \
+    --batch 16 \
+    --lr 1e-4 \
+    --d_model 64 \
+    --layers 2 \
+    --num_heads 4 \
+    --dropout 0.2
+
+------------------------------------------------------------
+ABLATION 4: Full Graph (fully connected adjacency matrix)
+(tests whether Reactome prior matters vs. data alone)
+------------------------------------------------------------
+python ablation4_full_graph.py \
+    --data_dir data \
+    --outdir outputs_ablation4_full_graph \
+    --epochs 200 \
+    --batch 16 \
+    --lr 1e-4 \
+    --d_model 64 \
+    --layers 2 \
+    --num_heads 4 \
+    --dropout 0.2
+
+------------------------------------------------------------
+OPTIONAL FLAGS (apply to any script above)
+------------------------------------------------------------
+--use_focal_loss          Use focal loss instead of cross-entropy
+--pe_dim 16               Positional encoding dimension (default: 16)
+--patience 25             Early stopping patience (default: 25)
+--min_epochs 50           Minimum epochs before early stopping (default: 50)
+--random_state 42         Random seed (default: 42)
+--val_size 0.1            Fraction of train set used for validation (default: 0.1)
+
+------------------------------------------------------------
+NOTES
+------------------------------------------------------------
+- Each ablation writes results to its own --outdir by default.
+- Results JSON, per-fold predictions CSV, and visualizations
+  (ROC, PR, confusion matrix) are saved inside the output directory.
+- Pathway importance rankings are saved under <outdir>/pathway_importance/.
+- To reproduce exactly, use the same --random_state across all runs.
