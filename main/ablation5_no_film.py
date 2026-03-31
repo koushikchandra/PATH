@@ -771,8 +771,10 @@ class PathwayGraphTransformer(nn.Module):
         
         X = Z + pe_projected.unsqueeze(0)
 
-        # ABLATION 1: No graph transformer — skip transformer layers entirely.
-        # Z + PE is fed directly to the pathway attention and classification head.
+        edge_feat = self.A.unsqueeze(-1) if self.use_edge_aware_blocks else None
+
+        for blk in self.layers:
+            X, _, edge_feat = blk(X, attn_mask=self.attn_mask, edge_feat=edge_feat)
 
         pw_scores = self.pathway_attention(X)
         pw_weights = F.softmax(pw_scores, dim=1)
@@ -982,7 +984,7 @@ def main_5fold_cv():
     """Main function for 5-fold stratified cross-validation"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data")
-    ap.add_argument("--outdir", default="outputs_ablation1_no_graph_transformer")
+    ap.add_argument("--outdir", default="outputs_ablation5_no_film")
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -1093,7 +1095,7 @@ def main_5fold_cv():
             layers=args.layers,
             num_heads=args.num_heads,
             dropout=args.dropout,
-            use_film=True,
+            use_film=False,  # ABLATION 5: disable FiLM gene encoder modulation
             use_edge_mask=not args.use_full_graph,  # No masking in full graph mode
             use_edge_bias=True,
             pe_dim=args.pe_dim,

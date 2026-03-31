@@ -79,6 +79,22 @@ python ablation4_full_graph.py \
     --dropout 0.2
 
 ------------------------------------------------------------
+ABLATION 5: No FiLM
+(replaces FiLM gene modulation with simple linear projection;
+ tests whether feature-wise linear conditioning contributes)
+------------------------------------------------------------
+python ablation5_no_film.py \
+    --data_dir data \
+    --outdir outputs_ablation5_no_film \
+    --epochs 200 \
+    --batch 16 \
+    --lr 1e-4 \
+    --d_model 64 \
+    --layers 2 \
+    --num_heads 4 \
+    --dropout 0.2
+
+------------------------------------------------------------
 OPTIONAL FLAGS (apply to any script above)
 ------------------------------------------------------------
 --use_focal_loss          Use focal loss instead of cross-entropy
