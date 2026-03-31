@@ -662,8 +662,8 @@ class PathwayGraphTransformer(nn.Module):
     def __init__(self, num_genes, num_pathways, max_pathway_genes,
                  d=64, layers=2, num_heads=4, dropout=0.2, use_film=True,
                  use_edge_mask=True, use_edge_bias=True, pe_dim=16,
-                 use_batch_norm=True, use_edge_aware_blocks=True, 
-                 full_graph_attention=False):
+                 use_batch_norm=True, use_edge_aware_blocks=True,
+                 full_graph_attention=False, learnable_edges=False):
         super().__init__()
         self.num_genes = num_genes
         self.num_pathways = num_pathways
@@ -674,6 +674,7 @@ class PathwayGraphTransformer(nn.Module):
         self.use_batch_norm = use_batch_norm
         self.use_edge_aware_blocks = use_edge_aware_blocks
         self.full_graph_attention = full_graph_attention
+        self.learnable_edges = learnable_edges
 
         self.gene_enc = GeneEncoderB(num_genes, d=d, hidden=64, use_film=use_film)
         self.pw_pool = PathwayAttentionPool(d=d, num_pathways=num_pathways, max_pathway_genes=max_pathway_genes)
@@ -736,18 +737,26 @@ class PathwayGraphTransformer(nn.Module):
         pe = self._laplacian_pe(A, self.pe_dim)
         self.PE = torch.cat([pe.detach(), deg.detach()], dim=1)
 
-        mask = torch.zeros_like(A)
-        if self.full_graph_attention:
-            mask = torch.zeros_like(A)
+        if self.learnable_edges:
+            # ABLATION 6: initialise edge logits from the Reactome prior so the
+            # model starts from a meaningful graph and learns to refine it.
+            # sigmoid(A_logits) gives the effective edge weight in [0, 1].
+            A_clamped = A.clamp(1e-4, 1 - 1e-4)
+            self.A_logits = nn.Parameter(torch.logit(A_clamped).to(dev))
+            # No structural masking — learned edge weights guide attention
+            self.attn_mask = torch.zeros_like(A).detach()
         else:
-            if self.use_edge_mask:
-                nonedge = (A <= 0)
-                # CHANGED: Use soft penalty instead of -inf
-                mask = mask.masked_fill(nonedge, -10.0)  # ← ONLY THIS LINE CHANGED!
-                # mask = mask.masked_fill(nonedge, float('-inf'))  # HARD mask
-                mask.fill_diagonal_(0.0)
-
-        self.attn_mask = mask.detach()
+            mask = torch.zeros_like(A)
+            if self.full_graph_attention:
+                mask = torch.zeros_like(A)
+            else:
+                if self.use_edge_mask:
+                    nonedge = (A <= 0)
+                    # CHANGED: Use soft penalty instead of -inf
+                    mask = mask.masked_fill(nonedge, -10.0)  # ← ONLY THIS LINE CHANGED!
+                    # mask = mask.masked_fill(nonedge, float('-inf'))  # HARD mask
+                    mask.fill_diagonal_(0.0)
+            self.attn_mask = mask.detach()
 
     def forward(self, mut: torch.Tensor, cnv: torch.Tensor, return_extras: bool = False, 
                 gene_ids: Optional[torch.Tensor] = None):
@@ -771,8 +780,17 @@ class PathwayGraphTransformer(nn.Module):
         
         X = Z + pe_projected.unsqueeze(0)
 
-        # ABLATION 1: No graph transformer — skip transformer layers entirely.
-        # Z + PE is fed directly to the pathway attention and classification head.
+        if self.learnable_edges:
+            # ABLATION 6: use learned edge weights; enforce no self-loops
+            A_eff = torch.sigmoid(self.A_logits)
+            diag = torch.eye(A_eff.size(0), device=A_eff.device, dtype=torch.bool)
+            A_eff = A_eff.masked_fill(diag, 0.0)
+            edge_feat = A_eff.unsqueeze(-1) if self.use_edge_aware_blocks else None
+        else:
+            edge_feat = self.A.unsqueeze(-1) if self.use_edge_aware_blocks else None
+
+        for blk in self.layers:
+            X, _, edge_feat = blk(X, attn_mask=self.attn_mask, edge_feat=edge_feat)
 
         pw_scores = self.pathway_attention(X)
         pw_weights = F.softmax(pw_scores, dim=1)
@@ -982,7 +1000,7 @@ def main_5fold_cv():
     """Main function for 5-fold stratified cross-validation"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data")
-    ap.add_argument("--outdir", default="outputs_ablation1_no_graph_transformer")
+    ap.add_argument("--outdir", default="outputs_ablation6_learnable_edges")
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -1094,12 +1112,13 @@ def main_5fold_cv():
             num_heads=args.num_heads,
             dropout=args.dropout,
             use_film=True,
-            use_edge_mask=not args.use_full_graph,  # No masking in full graph mode
+            use_edge_mask=not args.use_full_graph,
             use_edge_bias=True,
             pe_dim=args.pe_dim,
             use_batch_norm=args.use_batch_norm,
             use_edge_aware_blocks=args.use_edge_aware_blocks,
-            full_graph_attention=args.use_full_graph  # Enable full graph attention
+            full_graph_attention=args.use_full_graph,
+            learnable_edges=True,  # ABLATION 6: learn pathway-pathway edge weights
         ).to(device)
         
         model.set_structures(pathway_gene_lists, torch.from_numpy(A))

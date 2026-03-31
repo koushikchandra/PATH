@@ -508,36 +508,46 @@ def prepare_data_from_splits(mut_df, cnv_df, y, train_idx, val_idx, test_idx):
 # ===============================
 
 class GeneEncoderB(nn.Module):
-    def __init__(self, num_genes, d=128, hidden=64, positive_gamma=True):
+    def __init__(self, num_genes, d=128, hidden=64, positive_gamma=True, use_film=True):
         super().__init__()
+        self.use_film = use_film
         self.gene_emb = nn.Embedding(num_genes, d)
-        self.to_gammabeta = nn.Sequential(
-            nn.Linear(2, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 2*d)
-        )
+        if use_film:
+            self.to_gammabeta = nn.Sequential(
+                nn.Linear(2, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, 2*d)
+            )
+        else:
+            # No FiLM: simple linear projection of genomic features
+            self.genomic_proj = nn.Linear(2, d)
         self.positive_gamma = positive_gamma
         self._init_identity()
 
     def _init_identity(self):
-        last = self.to_gammabeta[-1]
-        nn.init.zeros_(last.weight)
-        with torch.no_grad():
-            d = last.bias.numel() // 2
-            last.bias[:d].fill_(0.0)
-            last.bias[d:].zero_()
+        if self.use_film:
+            last = self.to_gammabeta[-1]
+            nn.init.zeros_(last.weight)
+            with torch.no_grad():
+                d = last.bias.numel() // 2
+                last.bias[:d].fill_(0.0)
+                last.bias[d:].zero_()
         nn.init.normal_(self.gene_emb.weight, std=0.02)
 
     def forward(self, gene_ids, mut, cnv):
         e = self.gene_emb(gene_ids)
         x = torch.stack([mut, cnv], dim=-1)
-        gb = self.to_gammabeta(x)
-        gamma_raw, beta = gb.chunk(2, dim=-1)
-        if self.positive_gamma:
-            gamma = F.softplus(gamma_raw) + 1e-3
+        if self.use_film:
+            gb = self.to_gammabeta(x)
+            gamma_raw, beta = gb.chunk(2, dim=-1)
+            if self.positive_gamma:
+                gamma = F.softplus(gamma_raw) + 1e-3
+            else:
+                gamma = 1.0 + 0.1 * gamma_raw
+            h = gamma * e + beta
         else:
-            gamma = 1.0 + 0.1 * gamma_raw
-        h = gamma * e + beta
+            # No FiLM: gene embedding + linear projection of genomic features
+            h = e + self.genomic_proj(x)
         return h
 
 class PathwayAttentionPool(nn.Module):
@@ -665,7 +675,7 @@ class PathwayGraphTransformer(nn.Module):
         self.use_edge_aware_blocks = use_edge_aware_blocks
         self.full_graph_attention = full_graph_attention
 
-        self.gene_enc = GeneEncoderB(num_genes, d=d, hidden=64)
+        self.gene_enc = GeneEncoderB(num_genes, d=d, hidden=64, use_film=use_film)
         self.pw_pool = PathwayAttentionPool(d=d, num_pathways=num_pathways, max_pathway_genes=max_pathway_genes)
 
         in_pe = pe_dim + 1
