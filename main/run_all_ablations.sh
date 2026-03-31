@@ -41,6 +41,7 @@ declare -a SCRIPTS=(
     "ablation3_no_edge_features.py|outputs_ablation3_no_edge_features|Ablation 3: No Edge Features"
     "ablation4_full_graph.py|outputs_ablation4_full_graph|Ablation 4: Full Graph"
     "ablation5_no_film.py|outputs_ablation5_no_film|Ablation 5: No FiLM"
+    "ablation6_learnable_edges.py|outputs_ablation6_learnable_edges|Ablation 6: Learnable Edges"
 )
 
 # -----------------------------------------------------------------------

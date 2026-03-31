@@ -95,6 +95,22 @@ python ablation5_no_film.py \
     --dropout 0.2
 
 ------------------------------------------------------------
+ABLATION 6: Learnable Edges
+(A_logits initialised from Reactome prior via logit(A), then trained;
+ tests whether the model can discover novel pathway-pathway interactions)
+------------------------------------------------------------
+python ablation6_learnable_edges.py \
+    --data_dir data \
+    --outdir outputs_ablation6_learnable_edges \
+    --epochs 200 \
+    --batch 16 \
+    --lr 1e-4 \
+    --d_model 64 \
+    --layers 2 \
+    --num_heads 4 \
+    --dropout 0.2
+
+------------------------------------------------------------
 OPTIONAL FLAGS (apply to any script above)
 ------------------------------------------------------------
 --use_focal_loss          Use focal loss instead of cross-entropy
